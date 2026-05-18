@@ -38,7 +38,7 @@ services:
 
 
   qdrant:
-    image: qdrant/qdrant:v1.13.0
+    image: qdrant/qdrant:v1.18.0
     container_name: ufdr-qdrant
 
     restart: unless-stopped
