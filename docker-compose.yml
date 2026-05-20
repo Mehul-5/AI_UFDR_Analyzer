@@ -1,74 +1,78 @@
 version: "3.9"
 
 services:
-
   postgres:
     image: postgres:16
     container_name: ufdr-postgres
-
     restart: unless-stopped
-
     ports:
       - "5432:5432"
-
     environment:
       POSTGRES_USER: ufdr_user
       POSTGRES_PASSWORD: ufdr_password
       POSTGRES_DB: ufdr_db
-
+    # Constrain Postgres shared_buffers
+    command: postgres -c shared_buffers=128MB -c max_connections=50
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
 
   neo4j:
     image: neo4j:5
     container_name: ufdr-neo4j
-
     restart: unless-stopped
-
     ports:
       - "7474:7474"
       - "7687:7687"
-
     environment:
       NEO4J_AUTH: neo4j/password
-
+      # Starve the JVM to prevent it from eating all 4GB of RAM
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     volumes:
       - neo4j_data:/data
-
 
   qdrant:
     image: qdrant/qdrant:v1.18.0
     container_name: ufdr-qdrant
-
     restart: unless-stopped
-
     ports:
       - "6333:6333"
-
+    environment:
+      # Force Qdrant to use less RAM for internal structures
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: 2
+    deploy:
+      resources:
+        limits:
+          memory: 768M
     volumes:
       - qdrant_data:/qdrant/storage
-
 
   redis:
     image: redis:7-alpine
     container_name: ufdr-redis
-
     restart: unless-stopped
-
     ports:
       - "6379:6379"
-
+    # Cap Redis memory and force it to evict old keys if full
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     volumes:
       - redis_data:/data
 
-
 volumes:
-
   postgres_data:
-
   neo4j_data:
-
   qdrant_data:
-
   redis_data:
