@@ -63,19 +63,22 @@ async def upload_ufdr(
     case_id: str = "default-case-001"
 ):
     """
-    Receives a UFDR zip file via multipart form-data.
+    Receives a UFDR file via multipart form-data.
     Streams it to disk and enqueues an asynchronous Celery parsing task.
     """
-    if not file.filename.endswith('.zip') and not file.filename.endswith('.ufdr'):
-        raise HTTPException(status_code=400, detail="Invalid file type. Must be .zip or .ufdr")
+    # STRICT ENFORCEMENT: Only allow .ufdr extensions
+    if not file.filename.lower().endswith('.ufdr'):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid file type. Must be a .ufdr forensic extraction archive."
+        )
 
     job_id = str(uuid.uuid4())
     secure_file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
 
-    # PHASE 0: Stream the file to disk (Does not block memory!)
+    # PHASE 0: Stream the file to disk securely
     try:
         async with aiofiles.open(secure_file_path, 'wb') as out_file:
-            # Read in chunks of 1MB to keep memory footprint flat, even for 400MB files
             while content := await file.read(1024 * 1024):  
                 await out_file.write(content)
     except Exception as e:
@@ -92,7 +95,7 @@ async def upload_ufdr(
             "case_id": case_id,
             "task_id": task.id,
             "status": "QUEUED",
-            "message": "File received and queued for background processing."
+            "message": "UFDR file received and queued for background processing."
         }
     )
 

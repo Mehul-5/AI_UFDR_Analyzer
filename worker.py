@@ -1,6 +1,10 @@
 from celery import Celery
-import time
 import logging
+import zipfile
+import json
+import csv
+import io
+import xml.etree.ElementTree as ET
 from config import settings
 
 # Setup logging
@@ -8,7 +12,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize Celery
-# We use Redis as both the message broker and the result backend
 celery_app = Celery(
     "ufdr_worker",
     broker=settings.REDIS_URL,
@@ -21,7 +24,6 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    # This maps to ADR-003: acks_late=True guarantees we don't lose tasks on crash
     task_acks_late=True,
     worker_prefetch_multiplier=1
 )
@@ -30,25 +32,83 @@ celery_app.conf.update(
 def parse_ufdr_archive(self, job_id: str, file_path: str):
     """
     Background task to process the uploaded UFDR file.
-    Currently a skeleton. It will map to the 5 phases in your architecture.
+    Phase 1: In-Memory Decompression & Parsing
     """
     logger.info(f" [JOB: {job_id}] Worker picked up task. Target file: {file_path}")
     
     try:
-        # Phase 1: Decompress & Validate (Mocked for now)
-        logger.info(f" [JOB: {job_id}] Phase 1: Decompressing...")
-        time.sleep(2) # Simulating heavy I/O
+        # ---------------------------------------------------------
+        # PHASE 1: DECOMPRESS & PARSE (In-Memory Streaming)
+        # ---------------------------------------------------------
+        logger.info(f" [JOB: {job_id}] Phase 1: Unzipping and extracting entities...")
         
-        # Phase 2: Extract Entities (Mocked for now)
-        logger.info(f" [JOB: {job_id}] Phase 2: Extracting Messages and Calls...")
-        time.sleep(3) # Simulating parsing
+        # This dictionary will hold all our data to pass to the databases
+        parsed_data = {
+            "manifest": {},
+            "contacts": [],
+            "calls": [],
+            "messages": []
+        }
         
-        # Phase 3-5: Postgres, Neo4j, Vector DB sync will go here
-        
-        logger.info(f" [JOB: {job_id}] Processing complete!")
-        return {"status": "success", "job_id": job_id, "processed_file": file_path}
+        # Open the ZIP archive in read mode
+        with zipfile.ZipFile(file_path, 'r') as zf:
+            file_list = zf.namelist()
+            
+            # 1. Parse Manifest (XML)
+            if 'manifest.xml' in file_list:
+                with zf.open('manifest.xml') as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    device_node = root.find('.//Device')
+                    if device_node is not None:
+                        parsed_data["manifest"]["imei"] = device_node.findtext('IMEI', 'Unknown')
+                        parsed_data["manifest"]["model"] = device_node.findtext('Model', 'Unknown')
+                        parsed_data["manifest"]["os"] = device_node.findtext('OSVersion', 'Unknown')
+            
+            # 2. Parse Contacts (JSON)
+            if 'contacts.json' in file_list:
+                with zf.open('contacts.json') as f:
+                    parsed_data["contacts"] = json.load(f)
+                    
+            # 3. Parse Messages (JSON)
+            if 'messages.json' in file_list:
+                with zf.open('messages.json') as f:
+                    parsed_data["messages"] = json.load(f)
+                    
+            # 4. Parse Calls (CSV)
+            if 'calls.csv' in file_list:
+                with zf.open('calls.csv') as f:
+                    # CSV requires decoding bytes to string
+                    csv_data = f.read().decode('utf-8')
+                    reader = csv.DictReader(io.StringIO(csv_data))
+                    parsed_data["calls"] = list(reader)
 
+        logger.info(f" [JOB: {job_id}] Phase 1 Complete. "
+                    f"Parsed {len(parsed_data['contacts'])} contacts, "
+                    f"{len(parsed_data['calls'])} calls, and "
+                    f"{len(parsed_data['messages'])} messages.")
+
+        # ---------------------------------------------------------
+        # PHASE 2: POSTGRESQL BULK INSERT (Coming Next)
+        # ---------------------------------------------------------
+        logger.info(f" [JOB: {job_id}] Phase 2: Ready for database insertion...")
+        # (We will add the asyncpg database logic here in the next step)
+        
+        return {
+            "status": "success", 
+            "job_id": job_id, 
+            "data_summary": {
+                "device_model": parsed_data["manifest"].get("model"),
+                "contacts_found": len(parsed_data["contacts"]),
+                "calls_found": len(parsed_data["calls"]),
+                "messages_found": len(parsed_data["messages"])
+            }
+        }
+
+    except zipfile.BadZipFile:
+        logger.error(f" [JOB: {job_id}] Failed: File is not a valid zip/ufdr archive.")
+        raise
     except Exception as e:
-        logger.error(f" [JOB: {job_id}] Failed: {str(e)}")
-        # Exponential backoff retry
+        logger.error(f" [JOB: {job_id}] Failed during parsing: {str(e)}")
+        # Exponential backoff retry for transient errors
         raise self.retry(exc=e, countdown=2 ** self.request.retries)
