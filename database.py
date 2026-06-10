@@ -10,18 +10,61 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DatabaseManager:
-    """
-    Manages connection pools and clients for all core databases.
-    Ensures connections are opened securely on startup and closed cleanly on shutdown.
-    """
     def __init__(self):
         self.pg_pool = None
         self.neo4j_driver = None
         self.qdrant_client = None
 
+    async def init_models(self):
+        """
+        Creates the PostgreSQL schema if it does not exist.
+        Uses UNIQUE constraints on (job_id, entity_id) to guarantee idempotency.
+        """
+        logger.info("Verifying PostgreSQL schema...")
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    job_id TEXT NOT NULL,
+                    contact_id TEXT NOT NULL,
+                    display_name TEXT,
+                    phone_numbers TEXT[],
+                    organization TEXT,
+                    is_foreign BOOLEAN,
+                    UNIQUE(job_id, contact_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS calls (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    job_id TEXT NOT NULL,
+                    call_id TEXT NOT NULL,
+                    caller_phone TEXT,
+                    callee_phone TEXT,
+                    direction TEXT,
+                    call_type TEXT,
+                    duration_seconds INT,
+                    started_at TIMESTAMPTZ,
+                    UNIQUE(job_id, call_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    job_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    thread_id TEXT,
+                    platform TEXT,
+                    sender_phone TEXT,
+                    recipient_phones TEXT[],
+                    content_text TEXT,
+                    sent_at TIMESTAMPTZ,
+                    is_deleted BOOLEAN,
+                    UNIQUE(job_id, message_id)
+                );
+            """)
+        logger.info(" PostgreSQL schema verified.")
+
     async def connect(self):
         logger.info("Initializing database connections...")
-        
         try:
             # 1. PostgreSQL Connection Pool
             self.pg_pool = await asyncpg.create_pool(
@@ -34,8 +77,11 @@ class DatabaseManager:
                 max_size=10
             )
             logger.info(" PostgreSQL pool established.")
+            
+            # --- NEW: Initialize the tables immediately after connecting ---
+            await self.init_models()
 
-            # 2. Neo4j Async Driver (With Retry Logic for Cold Starts)
+            # 2. Neo4j Async Driver (With Retry Logic)
             max_retries = 5
             for attempt in range(max_retries):
                 try:
@@ -45,13 +91,13 @@ class DatabaseManager:
                     )
                     await self.neo4j_driver.verify_connectivity()
                     logger.info(" Neo4j driver connected.")
-                    break  # Success, exit the retry loop
+                    break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        logger.warning(f"⏳ Neo4j not ready yet (Attempt {attempt + 1}/{max_retries}). Retrying in 5 seconds...")
+                        logger.warning(f"⏳ Neo4j not ready yet. Retrying in 5 seconds...")
                         await asyncio.sleep(5)
                     else:
-                        logger.error(" Neo4j failed to connect after multiple attempts.")
+                        logger.error(" Neo4j failed to connect.")
                         raise e
 
             # 3. Qdrant Async Client
@@ -75,5 +121,4 @@ class DatabaseManager:
             await self.qdrant_client.close()
         logger.info("All database connections cleanly closed.")
 
-# Export a single instance to be used across the application
 db = DatabaseManager()
