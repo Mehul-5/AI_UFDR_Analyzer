@@ -105,3 +105,27 @@ During the integration of the Artificial Intelligence Retrieval-Augmented Genera
 * **The Symptom:** `400 Bad Request: Wrong input: Not existing vector name error`
 * **The Root Cause:** During the ingestion phase, the Celery worker uses Qdrant's high-level `.add(documents=...)` method. As a protective feature, Qdrant automatically creates a **named vector space** based on the model used (e.g., `"fast-bge-small-en-v1.5"`). However, when querying the database using a raw mathematical array of floats, Qdrant defaults to searching the *unnamed* (default) vector space, which did not exist.
 * **The Fix:** The explicit `using="fast-bge-small-en-v1.5"` parameter was added to the `query_points()` call. This successfully routes the explicit mathematical vector to the correct dimensionally-matched semantic partition within the collection.
+
+## 8. Hybrid RAG Data Flow (The Hallucination Fix)
+**Problem:** Initial RAG implementations passed raw vector-search text directly to the LLM. If the query asked for relationship data ("most frequently contacted person"), the LLM hallucinated because vector chunks lack structural graph context and human identity mapping.
+**Solution:** Implemented a multi-modal Hybrid Retrieval Service.
+* **Phase 1 (Intent):** Intercept and classify query intent to route to the correct databases.
+* **Phase 2 (Topology):** Use Neo4j (Cypher) to execute mathematical degree-centrality and relationship counts. Returns raw identifiers (e.g., `+15550101`).
+* **Phase 3 (Hydration):** Use PostgreSQL to map raw identifiers to relational truth (e.g., `Alice Johnson`).
+* **Phase 4 (Context Compilation):** Compile a strict, multi-part prompt forcing the LLM to read the relational truth *before* the semantic vector text.
+
+## 9. Eliminating N+1 Query Bottlenecks in Data Hydration
+**Problem:** During Phase 3 (Hydration), if Neo4j returned thousands of nodes, the FastAPI worker executed a sequential `SELECT` statement for every single node inside a `for` loop. 
+* **Impact:** This resulted in $O(N)$ network round-trips, instantly exhausting the connection pool (`max_size=10`), spiking database CPU, and causing cascading timeouts.
+
+**Solution: Array Overlap & In-Memory Mapping**
+* Refactored the data contract to collect all unique identifiers into a single Python `set`.
+* Utilized PostgreSQL's **Array Overlap Operator (`&&`)** to pass the entire list of identifiers in exactly *one* network request.
+* Shifted the matching computation from the Database/Network layer to the Application/Memory layer using Python's highly optimized `set.intersection()`.
+* **Result:** Network calls reduced from $O(N)$ to exactly $O(1)$.
+
+## 10. Resilience and Graceful Degradation
+**Problem:** In a microservice architecture, relying on three distinct databases (Graph, Vector, Relational) increases the probability of a partial system failure.
+**Solution:** We do not fail the entire extraction query if the semantic engine (Qdrant) times out. 
+* We use `asyncio.gather(*tasks, return_exceptions=True)` to execute Graph and Vector searches concurrently.
+* If Qdrant fails, the exception is caught, logged to the tracing system, and the LLM proceeds with structural graph data only. The system degrades gracefully rather than throwing a 500 Internal Server Error.
