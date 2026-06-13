@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str
 
+    # llm
+    COHERE_API_KEY: str
+
     # Tell Pydantic to read from the .env file
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 

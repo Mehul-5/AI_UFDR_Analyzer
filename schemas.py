@@ -21,3 +21,10 @@ class JobStatusResponse(BaseModel):
     status: str
     phase: Optional[str] = None
     error_message: Optional[str] = None
+
+class QueryRequest(BaseModel):
+    """
+    The payload sent by the investigator to ask the AI a question.
+    """
+    query: str = Field(..., description="The natural language question to ask the AI.")
+    job_id: Optional[str] = Field(None, description="Optional job ID to isolate the search to a specific case.")

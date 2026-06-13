@@ -81,8 +81,27 @@ In a production AI system, the LLM is the Brain, but Python is the Hands. You sh
 
 My Architecture: I am using Python (Celery) to do the deterministic heavy lifting. Python unzips the file, perfectly extracts the strings and dates, and loads them into PostgreSQL/Neo4j. The LLM only comes in at the very end (during the POST /api/v1/query phase) to read the already parsed text from the database to answer natural language questions.
 
-## 6 Canonical Ingestion - UFDR file
+## 6. Canonical Ingestion - UFDR file
 
 "In a production environment, forensic tools like Cellebrite, Magnet, or XRY all export data in completely different, proprietary formats. To make this architecture scalable, I decoupled the extraction logic from the database logic.
 
 I designed a Canonical Ingestion Schema (standardized JSON/CSV). For this demo, the synthetic payload is already in that canonical format. If we push this to production, we don't change the pipeline at all; we simply write adapter scripts for Cellebrite or Magnet that convert their proprietary SQLite/XML outputs into my canonical JSON schema before handing it to the Celery worker."
+
+## 7. Vector Database (Qdrant) Asynchronous Integration Quirks
+
+During the integration of the Artificial Intelligence Retrieval-Augmented Generation (RAG) pipeline, several undocumented quirks regarding Qdrant's newer Python SDKs (`v1.16+`) and its asynchronous client (`AsyncQdrantClient`) were encountered and resolved.
+
+### A. The `.search()` Deprecation
+* **The Symptom:** `AttributeError: 'AsyncQdrantClient' object has no attribute 'search'`
+* **The Root Cause:** In recent versions of the Qdrant SDK, the standard `.search()` method was completely deprecated and removed from the asynchronous client in favor of a unified universal querying interface.
+* **The Fix:** The FastAPI retrieval endpoint was refactored to use `.query_points()`. This required updating the parameter syntax (changing `query_vector` to `query`) and extracting the results via the `.points` attribute of the response object.
+
+### B. Asynchronous FastEmbed Silent Failures
+* **The Symptom:** `400 Bad Request: Format error in JSON body: Expected some form of vector`
+* **The Root Cause:** Qdrant's synchronous client natively supports passing raw text strings directly to the database, automatically intercepting the string and using `fastembed` to convert it to a vector under the hood. However, the `AsyncQdrantClient` occasionally fails to trigger this middleware, passing the raw string directly to the Rust database engine, which strictly expects an array of floats.
+* **The Architectural Fix:** Instead of relying on the database client's "magic" text-to-vector routing, the architecture was updated to explicitly decouple the embedding model from the database client. The FastAPI server manually instantiates `TextEmbedding("BAAI/bge-small-en-v1.5")`, converts the user's query into a mathematical array (`.tolist()`), and passes the explicit floats to Qdrant. This ensures deterministic behavior and strict type-safety.
+
+### C. The Named Vector Space Mismatch
+* **The Symptom:** `400 Bad Request: Wrong input: Not existing vector name error`
+* **The Root Cause:** During the ingestion phase, the Celery worker uses Qdrant's high-level `.add(documents=...)` method. As a protective feature, Qdrant automatically creates a **named vector space** based on the model used (e.g., `"fast-bge-small-en-v1.5"`). However, when querying the database using a raw mathematical array of floats, Qdrant defaults to searching the *unnamed* (default) vector space, which did not exist.
+* **The Fix:** The explicit `using="fast-bge-small-en-v1.5"` parameter was added to the `query_points()` call. This successfully routes the explicit mathematical vector to the correct dimensionally-matched semantic partition within the collection.
