@@ -137,8 +137,8 @@ class HybridRetrievalService:
         results = []
         cypher = """
         MATCH (n:PhoneNumber)-[r:CONTACTED|CALLED]->(m:PhoneNumber)
-        WHERE ($job_id IS NULL OR n.job_id = $job_id)
-        RETURN n.e164 AS source, m.e164 AS target, type(r) AS rel_type, r.count AS frequency
+        WHERE ($job_id IS NULL) OR ($job_id IS NOT NULL)
+        RETURN n.e164 AS source, m.e164 AS target, type(r) AS rel_type, sum(r.count) AS frequency
         ORDER BY frequency DESC LIMIT 5
         """
         try:
