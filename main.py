@@ -18,6 +18,8 @@ from schemas import QueryRequest
 from pydantic import ValidationError
 import json
 from schemas import QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext
+from telemetry import configure_telemetry
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,6 +33,16 @@ async def lifespan(app: FastAPI):
     
     # SHUTDOWN: Close all database connections securely
     await db.disconnect()
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    description="API for ingesting and querying forensic extraction reports.",
+    lifespan=lifespan
+)
+
+# Initialize observability for the API layer
+configure_telemetry(app=app)
 
 
 app = FastAPI(

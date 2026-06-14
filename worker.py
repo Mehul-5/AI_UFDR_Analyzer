@@ -12,6 +12,27 @@ from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from qdrant_client import QdrantClient
 from config import settings
+from celery.signals import worker_process_init
+from telemetry import configure_telemetry
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+celery_app = Celery(
+    "ufdr_worker",
+    broker=settings.REDIS_URL,
+    backend=settings.REDIS_URL
+)
+
+# Ensure telemetry is configured when the worker process boots
+@worker_process_init.connect(weak=False)
+def init_celery_tracing(*args, **kwargs):
+    configure_telemetry(is_worker=True)
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -170,21 +191,32 @@ def parse_ufdr_archive(self, job_id: str, file_path: str):
         logger.info(f"[JOB: {job_id}] Phase 1: Unzipping and extracting entities...")
         parsed_data = {"manifest": {}, "contacts": [], "calls": [], "messages": []}
         
-        with zipfile.ZipFile(file_path, 'r') as zf:
-            file_list = zf.namelist()
-            if 'manifest.xml' in file_list:
-                with zf.open('manifest.xml') as f:
-                    device_node = ET.parse(f).getroot().find('.//Device')
-                    if device_node is not None:
-                        parsed_data["manifest"]["imei"] = device_node.findtext('IMEI', 'Unknown')
-                        parsed_data["manifest"]["model"] = device_node.findtext('Model', 'Unknown')
-                        parsed_data["manifest"]["os"] = device_node.findtext('OSVersion', 'Unknown')
-            if 'contacts.json' in file_list:
-                with zf.open('contacts.json') as f: parsed_data["contacts"] = json.load(f)
-            if 'messages.json' in file_list:
-                with zf.open('messages.json') as f: parsed_data["messages"] = json.load(f)
-            if 'calls.csv' in file_list:
-                with zf.open('calls.csv') as f: parsed_data["calls"] = list(csv.DictReader(io.StringIO(f.read().decode('utf-8'))))
+        with tracer.start_as_current_span("unzip_and_parse_ufdr") as span:
+            span.set_attribute("job_id", job_id)
+            span.set_attribute("file_path", file_path)
+            
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                file_list = zf.namelist()
+                
+                if 'manifest.xml' in file_list:
+                    with zf.open('manifest.xml') as f:
+                        device_node = ET.parse(f).getroot().find('.//Device')
+                        if device_node is not None:
+                            parsed_data["manifest"]["imei"] = device_node.findtext('IMEI', 'Unknown')
+                            parsed_data["manifest"]["model"] = device_node.findtext('Model', 'Unknown')
+                            parsed_data["manifest"]["os"] = device_node.findtext('OSVersion', 'Unknown')
+                            
+                if 'contacts.json' in file_list:
+                    with zf.open('contacts.json') as f: 
+                        parsed_data["contacts"] = json.load(f)
+                        
+                if 'messages.json' in file_list:
+                    with zf.open('messages.json') as f: 
+                        parsed_data["messages"] = json.load(f)
+                        
+                if 'calls.csv' in file_list:
+                    with zf.open('calls.csv') as f: 
+                        parsed_data["calls"] = list(csv.DictReader(io.StringIO(f.read().decode('utf-8'))))
 
         # PHASE 2: POSTGRESQL BULK INSERT
         logger.info(f"[JOB: {job_id}] Phase 2: Inserting into PostgreSQL...")
