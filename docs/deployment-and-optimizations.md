@@ -129,3 +129,36 @@ During the integration of the Artificial Intelligence Retrieval-Augmented Genera
 **Solution:** We do not fail the entire extraction query if the semantic engine (Qdrant) times out. 
 * We use `asyncio.gather(*tasks, return_exceptions=True)` to execute Graph and Vector searches concurrently.
 * If Qdrant fails, the exception is caught, logged to the tracing system, and the LLM proceeds with structural graph data only. The system degrades gracefully rather than throwing a 500 Internal Server Error.
+
+## 11. Core Architectural Optimizations (V2)
+
+The system has undergone a major architectural refactor to transition from a functional prototype to a production-grade, multi-tenant forensic analysis engine. The following optimizations were implemented to address critical bottlenecks in I/O, memory, security, and external API reliance.
+
+### 11.1. High-Throughput Database Ingestion (The Staging Table Pattern)
+**Problem:** Executing hundreds of thousands of individual `INSERT ... ON CONFLICT DO NOTHING` statements over TCP caused severe network latency and I/O bottlenecks during the extraction of large UFDR files.
+**Solution:**
+We implemented the **Staging Table Pattern** utilizing PostgreSQL's binary `COPY` protocol.
+* **Atomic Transactions:** The ingestion is wrapped in a strict `asyncpg.transaction()`. 
+* **Temporary Staging:** We execute `CREATE TEMP TABLE tmp_entities (LIKE entities INCLUDING ALL) ON COMMIT DROP;`. This completely avoids Write-Ahead Log (WAL) overhead.
+* **Idempotency & Retries:** Data is streamed via `COPY` into the temp table, followed by a bulk `INSERT INTO ... SELECT * FROM tmp_entities ON CONFLICT DO NOTHING`. Because it drops on commit/rollback, if the database connection drops mid-ingestion, Celery can safely retry the task (`acks_late=True`) without throwing schema conflict errors.
+
+### 11.2. Graph Database Tenant Isolation (RBAC Bounded Context)
+**Problem:** Originally, `PhoneNumber` nodes were merged globally across the entire database. This created a catastrophic security risk where graphing a phone number could bleed communications across unrelated criminal cases or isolated tenants.
+**Solution:**
+We implemented **Role-Based Access Control (RBAC) via Sub-Graph Isolation**.
+* **Root Anchors:** Every entity (Contact, Call, Message, PhoneNumber) is now strictly anchored to a root `(c:Case {case_id})` node via an `[:OWNS]` relationship.
+* **Bounded Traversals:** Our Hybrid Retrieval Engine now injects the `case_id` into every Cypher query (e.g., `MATCH (c:Case {case_id: $case_id})-[:OWNS]->(sender:PhoneNumber)...`). This guarantees mathematical isolation of the graph, ensuring analysts can only traverse data belonging to the specific case they are querying.
+
+### 11.3. Memory-Safe Processing (Streaming Parsers)
+**Problem:** Forensic extraction files often contain JSON or CSV artifacts exceeding 400MB. Utilizing standard DOM parsers or `json.load()` loaded the entire file into RAM simultaneously, triggering Linux Out-Of-Memory (OOM) kills on the Celery workers.
+**Solution:**
+We transitioned to pure iterative streaming for all Phase 1 ingestion operations.
+* **JSON Streaming:** Replaced `json.load()` with the `ijson` library (`ijson.items()`), which yields top-level JSON objects iteratively directly from the disk stream, reducing RAM footprint to near zero regardless of file size.
+* **CSV Streaming:** Utilized `io.TextIOWrapper` to stream byte chunks natively into `csv.DictReader` without loading the underlying payload into memory.
+
+### 11.4. Resilient LLM Gateway (Circuit Breakers & Interfaces)
+**Problem:** Hardcoding the Cohere SDK inside the retrieval engine violated the Dependency Inversion Principle. Furthermore, hitting a `429 Too Many Requests` API rate limit caused the application to crash, leaving the investigator with zero data.
+**Solution:**
+We decoupled the LLM logic and implemented a Circuit Breaker pattern.
+* **Provider Interface:** Abstracted the AI synthesis behind an `LLMGatewayInterface`, allowing the backend to swap between Cohere, OpenAI, or local Llama models without altering the core retrieval orchestration.
+* **Graceful Degradation:** Wrapped the LLM implementation in a `CircuitBreakerLLM` class. If the failure threshold (e.g., rate limits) is exceeded, the circuit opens. Instead of throwing a 500 error, the API dynamically drops into "degraded mode," bypassing the synthesis engine and returning the raw, un-synthesized forensic vectors directly to the user so investigations are never fully blocked.

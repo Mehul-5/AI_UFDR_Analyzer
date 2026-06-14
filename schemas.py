@@ -17,8 +17,8 @@ class JobStatusResponse(BaseModel):
     error_message: Optional[str] = None
 
 class QueryRequest(BaseModel):
-    query: str = Field(..., description="The natural language question to ask the AI.")
-    job_id: Optional[str] = Field(None, description="Optional job ID to isolate the search.")
+    query: str
+    case_id: Optional[str] = "default-case-001"
 
 # --- HYBRID RAG SCHEMAS ---
 

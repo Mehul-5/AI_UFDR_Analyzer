@@ -15,8 +15,10 @@ from config import settings
 from celery.signals import worker_process_init
 from telemetry import configure_telemetry
 from opentelemetry import trace
+import ijson
 
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -60,40 +62,117 @@ def parse_iso_date(date_str):
     return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
 
 async def bulk_insert_postgres(job_id: str, parsed_data: dict):
+    # Acquire a connection from the pool
     conn = await asyncpg.connect(
-        user=settings.POSTGRES_USER,
-        password=settings.POSTGRES_PASSWORD,
-        database=settings.POSTGRES_DB,
-        host=settings.POSTGRES_SERVER,
-        port=settings.POSTGRES_PORT
+        user=settings.POSTGRES_USER, password=settings.POSTGRES_PASSWORD,
+        database=settings.POSTGRES_DB, host=settings.POSTGRES_SERVER, port=settings.POSTGRES_PORT
     )
+    
     try:
-        if parsed_data["contacts"]:
-            contact_tuples = [(job_id, c.get("contact_id"), c.get("display_name"), c.get("phone_numbers", []), c.get("organization"), c.get("is_foreign", False)) for c in parsed_data["contacts"]]
-            await conn.executemany("INSERT INTO contacts (job_id, contact_id, display_name, phone_numbers, organization, is_foreign) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (job_id, contact_id) DO NOTHING", contact_tuples)
+        async with conn.transaction():
+            
+            if parsed_data.get("messages"):
+                # 1. Create a temporary staging table that drops itself when the transaction ends
+                await conn.execute("CREATE TEMP TABLE tmp_messages (LIKE messages INCLUDING ALL) ON COMMIT DROP;")
+                
+                # 2. Format the data for COPY
+                message_tuples = [
+                    (job_id, m.get("message_id"), m.get("thread_id"), m.get("platform"), 
+                     m.get("sender_phone"), m.get("recipient_phones", []), m.get("content_text"), 
+                     parse_iso_date(m.get("sent_at")), m.get("is_deleted", False)) 
+                    for m in parsed_data["messages"]
+                ]
+                
+                # 3. Stream binary data directly to the staging table (Blazing Fast)
+                await conn.copy_records_to_table(
+                    'tmp_messages',
+                    columns=['job_id', 'message_id', 'thread_id', 'platform', 'sender_phone', 'recipient_phones', 'content_text', 'sent_at', 'is_deleted'],
+                    records=message_tuples
+                )
+                
+                # 4. Bulk INSERT from staging to production, handling conflicts
+                await conn.execute("""
+                    INSERT INTO messages 
+                    SELECT * FROM tmp_messages 
+                    ON CONFLICT (job_id, message_id) DO NOTHING;
+                """)
 
-        if parsed_data["calls"]:
-            call_tuples = [(job_id, c.get("call_id"), c.get("caller_phone"), c.get("callee_phone"), c.get("direction"), c.get("call_type"), int(c.get("duration_seconds", 0)), parse_iso_date(c.get("started_at"))) for c in parsed_data["calls"]]
-            await conn.executemany("INSERT INTO calls (job_id, call_id, caller_phone, callee_phone, direction, call_type, duration_seconds, started_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (job_id, call_id) DO NOTHING", call_tuples)
-
-        if parsed_data["messages"]:
-            message_tuples = [(job_id, m.get("message_id"), m.get("thread_id"), m.get("platform"), m.get("sender_phone"), m.get("recipient_phones", []), m.get("content_text"), parse_iso_date(m.get("sent_at")), m.get("is_deleted", False)) for m in parsed_data["messages"]]
-            await conn.executemany("INSERT INTO messages (job_id, message_id, thread_id, platform, sender_phone, recipient_phones, content_text, sent_at, is_deleted) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (job_id, message_id) DO NOTHING", message_tuples)
     finally:
         await conn.close()
 
-async def build_graph_neo4j(job_id: str, parsed_data: dict):
-    driver = AsyncGraphDatabase.driver(settings.NEO4J_URI, auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD))
+async def build_graph_neo4j(job_id: str, case_id: str, parsed_data: dict):
+    driver = AsyncGraphDatabase.driver(
+        settings.NEO4J_URI, 
+        auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+    )
     try:
         async with driver.session() as session:
-            if parsed_data["contacts"]:
-                await session.run("UNWIND $contacts AS c MERGE (ct:Contact {contact_id: c.contact_id}) SET ct.display_name = c.display_name, ct.organization = c.organization, ct.job_id = $job_id WITH ct, c UNWIND c.phone_numbers AS phone MERGE (pn:PhoneNumber {e164: phone}) MERGE (pn)-[:ASSIGNED_TO]->(ct)", contacts=parsed_data["contacts"], job_id=job_id)
+            # 1. Anchor the Case Node (The Root Tenant Boundary)
+            await session.run("MERGE (c:Case {case_id: $case_id})", case_id=case_id)
 
-            if parsed_data["messages"]:
-                await session.run("UNWIND $messages AS m MERGE (msg:Message {message_id: m.message_id}) SET msg.platform = m.platform, msg.sent_at = datetime(m.sent_at), msg.job_id = $job_id WITH msg, m MERGE (sender:PhoneNumber {e164: m.sender_phone}) MERGE (msg)-[:SENT_BY]->(sender) WITH msg, m, sender UNWIND m.recipient_phones AS recip_phone MERGE (recip:PhoneNumber {e164: recip_phone}) MERGE (msg)-[:RECEIVED_BY]->(recip) MERGE (sender)-[rel:CONTACTED]->(recip) ON CREATE SET rel.count = 1, rel.last_contact = datetime(m.sent_at) ON MATCH SET rel.count = rel.count + 1, rel.last_contact = CASE WHEN datetime(m.sent_at) > coalesce(rel.last_contact, datetime('1970-01-01T00:00:00Z')) THEN datetime(m.sent_at) ELSE rel.last_contact END", messages=parsed_data["messages"], job_id=job_id)
+            # 2. Ingest Contacts
+            if parsed_data.get("contacts"):
+                cypher_contacts = """
+                MATCH (case:Case {case_id: $case_id})
+                UNWIND $contacts AS c 
+                MERGE (ct:Contact {contact_id: c.contact_id, job_id: $job_id}) 
+                SET ct.display_name = c.display_name, ct.organization = c.organization 
+                MERGE (case)-[:OWNS]->(ct)
+                WITH ct, c, case 
+                UNWIND c.phone_numbers AS phone 
+                MERGE (pn:PhoneNumber {e164: phone}) 
+                MERGE (case)-[:OWNS]->(pn)
+                MERGE (pn)-[:ASSIGNED_TO]->(ct)
+                """
+                await session.run(cypher_contacts, contacts=parsed_data["contacts"], job_id=job_id, case_id=case_id)
+                
+            # 3. Ingest Calls
+            if parsed_data.get("calls"):
+                cypher_calls = """
+                MATCH (case:Case {case_id: $case_id})
+                UNWIND $calls AS call
+                MERGE (cl:Call {call_id: call.call_id, job_id: $job_id})
+                SET cl.duration_seconds = toInteger(call.duration_seconds),
+                    cl.started_at = datetime(call.started_at),
+                    cl.direction = call.direction,
+                    cl.call_type = call.call_type
+                MERGE (case)-[:OWNS]->(cl)
+                WITH cl, call, case
+                MERGE (caller:PhoneNumber {e164: call.caller_phone})
+                MERGE (callee:PhoneNumber {e164: call.callee_phone})
+                MERGE (case)-[:OWNS]->(caller)
+                MERGE (case)-[:OWNS]->(callee)
+                MERGE (caller)-[:MADE_CALL]->(cl)
+                MERGE (cl)-[:RECEIVED_BY]->(callee)
+                """
+                await session.run(cypher_calls, calls=parsed_data["calls"], job_id=job_id, case_id=case_id)
 
-            if parsed_data["calls"]:
-                await session.run("UNWIND $calls AS c MERGE (caller:PhoneNumber {e164: c.caller_phone}) MERGE (callee:PhoneNumber {e164: c.callee_phone}) MERGE (caller)-[rel:CALLED]->(callee) ON CREATE SET rel.count = 1, rel.total_duration = toInteger(c.duration_seconds) ON MATCH SET rel.count = rel.count + 1, rel.total_duration = rel.total_duration + toInteger(c.duration_seconds)", calls=parsed_data["calls"], job_id=job_id)
+            # 4. Ingest Messages
+            if parsed_data.get("messages"):
+                cypher_messages = """
+                MATCH (case:Case {case_id: $case_id})
+                UNWIND $messages AS msg
+                MERGE (m:Message {message_id: msg.message_id, job_id: $job_id})
+                SET m.content_text = msg.content_text,
+                    m.sent_at = datetime(msg.sent_at),
+                    m.platform = msg.platform,
+                    m.is_deleted = msg.is_deleted
+                MERGE (case)-[:OWNS]->(m)
+                WITH m, msg, case
+                MERGE (sender:PhoneNumber {e164: msg.sender_phone})
+                MERGE (case)-[:OWNS]->(sender)
+                MERGE (sender)-[:SENT_MESSAGE]->(m)
+                WITH m, msg, case
+                UNWIND msg.recipient_phones AS recipient
+                MERGE (rec_pn:PhoneNumber {e164: recipient})
+                MERGE (case)-[:OWNS]->(rec_pn)
+                MERGE (m)-[:RECEIVED_BY]->(rec_pn)
+                """
+                await session.run(cypher_messages, messages=parsed_data["messages"], job_id=job_id, case_id=case_id)
+
+    except Exception as e:
+        logger.error(f"[JOB: {job_id}] Neo4j Graph Build Failed: {str(e)}")
+        raise e
     finally:
         await driver.close()
 
@@ -183,7 +262,7 @@ def build_vector_index(job_id: str, parsed_data: dict):
 
 
 @celery_app.task(bind=True, name="parse_ufdr_archive", max_retries=3)
-def parse_ufdr_archive(self, job_id: str, file_path: str):
+def parse_ufdr_archive(self, job_id: str, file_path: str, case_id: str):
     logger.info(f"[JOB: {job_id}] Worker picked up task. Target file: {file_path}")
     
     try:
@@ -198,6 +277,7 @@ def parse_ufdr_archive(self, job_id: str, file_path: str):
             with zipfile.ZipFile(file_path, 'r') as zf:
                 file_list = zf.namelist()
                 
+                # --- MANIFEST (XML) ---
                 if 'manifest.xml' in file_list:
                     with zf.open('manifest.xml') as f:
                         device_node = ET.parse(f).getroot().find('.//Device')
@@ -206,17 +286,29 @@ def parse_ufdr_archive(self, job_id: str, file_path: str):
                             parsed_data["manifest"]["model"] = device_node.findtext('Model', 'Unknown')
                             parsed_data["manifest"]["os"] = device_node.findtext('OSVersion', 'Unknown')
                             
+                # --- CONTACTS (STREAMING JSON) ---
                 if 'contacts.json' in file_list:
                     with zf.open('contacts.json') as f: 
-                        parsed_data["contacts"] = json.load(f)
+                        import ijson # Make sure 'ijson' is in requirements.txt
+                        parser = ijson.items(f, 'item')
+                        for contact in parser:
+                            parsed_data["contacts"].append(contact)
                         
+                # --- MESSAGES (STREAMING JSON) ---
                 if 'messages.json' in file_list:
                     with zf.open('messages.json') as f: 
-                        parsed_data["messages"] = json.load(f)
+                        parser = ijson.items(f, 'item')
+                        for message in parser:
+                            parsed_data["messages"].append(message)
                         
+                # --- CALLS (STREAMING CSV) ---
                 if 'calls.csv' in file_list:
                     with zf.open('calls.csv') as f: 
-                        parsed_data["calls"] = list(csv.DictReader(io.StringIO(f.read().decode('utf-8'))))
+                        import io, csv
+                        text_stream = io.TextIOWrapper(f, encoding='utf-8')
+                        reader = csv.DictReader(text_stream)
+                        for call in reader:
+                            parsed_data["calls"].append(call)
 
         # PHASE 2: POSTGRESQL BULK INSERT
         logger.info(f"[JOB: {job_id}] Phase 2: Inserting into PostgreSQL...")
@@ -224,7 +316,7 @@ def parse_ufdr_archive(self, job_id: str, file_path: str):
         
         # PHASE 3: NEO4J GRAPH CONSTRUCTION
         logger.info(f"[JOB: {job_id}] Phase 3: Building Neo4j Graph Topology...")
-        asyncio.run(build_graph_neo4j(job_id, parsed_data))
+        asyncio.run(build_graph_neo4j(job_id, case_id, parsed_data))
 
         # PHASE 4: QDRANT SEMANTIC CHUNKING
         logger.info(f"[JOB: {job_id}] Phase 4: Building Vector Index...")
