@@ -120,7 +120,7 @@
                                 ▼
                    ┌────────────────────────────┐
                    │       LLM API Gateway       │
-                   │   (Claude / GPT-4o class)   │
+                   │   (cohere)                  │
                    │   Prompt: context + docs    │
                    │   Response: streamed JSON   │
                    └────────────────────────────┘

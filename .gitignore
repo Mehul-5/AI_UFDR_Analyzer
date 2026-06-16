@@ -13,7 +13,7 @@ secure_store/
 *.zip
 *.bin
 
-# Database Local Volumes (If you accidentally created them in the repo)
+# Database Local Volumes 
 postgres_data/
 neo4j_data/
 qdrant_data/
