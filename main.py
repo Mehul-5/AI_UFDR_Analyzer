@@ -1,39 +1,29 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from config import settings
-from database import db
-import uuid
+import asyncio
+import hashlib
 import os
+import uuid
 import aiofiles
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from schemas import ExtractionResponse
-from worker import parse_ufdr_archive
+from fastapi.middleware.cors import CORSMiddleware
 import cohere
-from typing import List, Dict, Any, Optional
 from fastembed import TextEmbedding
 from qdrant_client import models
-from schemas import QueryRequest
 from pydantic import ValidationError
 import json
-from schemas import QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext
+from worker import celery_app
+from config import settings
+from database import db
+from schemas import QueryRequest, QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext
 from telemetry import configure_telemetry
 from llm_service import CohereStrategy, CircuitBreakerLLM
 from worker import parse_ufdr_archive
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI Lifespan Context Manager.
-    """
-    # STARTUP: Connect to all databases
     await db.connect()
-        
-    yield  # Application runs here
-    
-    # SHUTDOWN: Close all database connections securely
+    yield  
     await db.disconnect()
 
 app = FastAPI(
@@ -43,90 +33,95 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Initialize observability for the API layer
-configure_telemetry(app=app)
-
-
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
-    description="API for ingesting and querying forensic extraction reports.",
-    lifespan=lifespan  # Attach the lifespan manager here
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Initialize AI Models Globally
+configure_telemetry(app=app)
+
 embedding_model = TextEmbedding("BAAI/bge-small-en-v1.5")
 cohere_client = cohere.AsyncClient(settings.COHERE_API_KEY)
 llm_gateway = CircuitBreakerLLM(strategy=CohereStrategy())
 
-
-@app.get("/health", tags=["System"])
-async def health_check():
-    """
-    Advanced health check endpoint.
-    Verifies that the API is running AND that database objects exist.
-    """
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "online",
-            "project": settings.PROJECT_NAME,
-            "connections": {
-                "postgres": db.pg_pool is not None,
-                "neo4j": db.neo4j_driver is not None,
-                "qdrant": db.qdrant_client is not None
-            }
-        }
-    )
-
-# Ensuring a directory exists to store the uploaded files securely
 UPLOAD_DIR = "secure_store"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app = FastAPI(lifespan=lifespan)
+@app.get("/health", tags=["System"])
+async def health_check():
+    return JSONResponse(
+        status_code=200,
+        content={"status": "online", "project": settings.PROJECT_NAME}
+    )
 
 @app.post("/api/v1/extract", tags=["Ingestion"])
 async def extract_ufdr(
-    case_id: str, # IMPORTANT: Require case_id in the query parameter
+    case_id: str,
     file: UploadFile = File(...)
 ):
-    """
-    Receives a UFDR file via multipart form-data.
-    Streams it to disk and enqueues an asynchronous Celery parsing task.
-    """
-    # STRICT ENFORCEMENT: Only allow .ufdr extensions
     if not file.filename.lower().endswith('.ufdr'):
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid file type. Must be a .ufdr forensic extraction archive."
-        )
+        raise HTTPException(status_code=400, detail="Invalid file type. Must be a .ufdr archive.")
 
     job_id = str(uuid.uuid4())
     secure_file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    hasher = hashlib.sha256()
 
-    # PHASE 0: Stream the file to disk securely
     try:
-        import aiofiles
         async with aiofiles.open(secure_file_path, 'wb') as out_file:
             while content := await file.read(1024 * 1024):  
+                # 🚀 THE FIX: Offload CPU-heavy cryptography to a background thread
+                await asyncio.to_thread(hasher.update, content)
                 await out_file.write(content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
-    # Dispatch to Celery, passing the NEW case_id parameter
-    task = parse_ufdr_archive.apply_async(args=[job_id, secure_file_path, case_id])
+    file_hash = hasher.hexdigest()
+
+    async with db.pg_pool.acquire() as conn:
+        existing_record = await conn.fetchval(
+            "SELECT id FROM ingested_files WHERE case_id = $1 AND file_hash = $2",
+            case_id, file_hash
+        )
+        
+        if existing_record:
+            os.remove(secure_file_path) 
+            return JSONResponse(
+                status_code=409, 
+                content={
+                    "status": "CONFLICT", "job_id": None, "case_id": case_id,
+                    "message": "This exact file has already been ingested into this case."
+                }
+            )
+            
+        await conn.execute(
+            "INSERT INTO ingested_files (case_id, file_hash, filename) VALUES ($1, $2, $3)",
+            case_id, file_hash, file.filename
+        )
+
+    # Dispatch to Celery worker with matching IDs
+    task = parse_ufdr_archive.apply_async(args=[job_id, secure_file_path, case_id], task_id=job_id)
     
-    # Return HTTP 202 Accepted immediately
     return JSONResponse(
         status_code=202,
         content={
-            "status": "QUEUED",
-            "job_id": job_id,
-            "case_id": case_id,
-            "task_id": task.id, # <--- THIS FIXES THE PYLANCE WARNING!
+            "status": "QUEUED", "job_id": job_id, "case_id": case_id, "task_id": task.id,
             "message": "UFDR extraction dispatched to background worker."
         }
     )
+
+@app.get("/api/v1/jobs/{job_id}/status", tags=["Ingestion"])
+async def get_job_status(job_id: str):
+    """Fetch the real-time status of the Celery worker."""
+    task = celery_app.AsyncResult(job_id)
+    
+    return JSONResponse(status_code=200, content={
+        "job_id": job_id,
+        "status": task.state,
+        "error_message": str(task.info) if task.state == 'FAILURE' else None
+    })
 
 class HybridRetrievalService:
     def __init__(self, database, cohere_cli, embedder):
@@ -150,7 +145,7 @@ class HybridRetrievalService:
         except Exception:
             return QueryIntent(requires_graph=True, requires_semantic=True, extracted_identifiers=[])
 
-    async def fetch_graph_topology(self, case_id: str) -> List[GraphNodeResult]:
+    async def fetch_graph_topology(self, case_id: str) -> list[GraphNodeResult]:
         """Phase 2: Calculate actual relationship math in Neo4j bounded by Case RBAC."""
         results = []
         
@@ -205,7 +200,7 @@ class HybridRetrievalService:
                     
         return hydrated
 
-    async def fetch_semantic_chunks(self, query: str, case_id: str) -> List[Dict]:
+    async def fetch_semantic_chunks(self, query: str, case_id: str) -> list[dict]:
         """Phase 4: Fetch context from Qdrant using case_id."""
         query_vector = list(self.embedder.embed([query]))[0].tolist()
         
@@ -252,7 +247,7 @@ class HybridRetrievalService:
 
         return context
 
-    async def fetch_semantic_chunks(self, query: str, job_id: str) -> List[Dict]:
+    async def fetch_semantic_chunks(self, query: str, job_id: str) -> list[dict]:
         """Phase 4: Fetch context from Qdrant."""
         query_vector = list(self.embedder.embed([query]))[0].tolist()
         search_filter = None
@@ -317,7 +312,7 @@ class HybridRetrievalService:
         except Exception:
             return QueryIntent(requires_graph=True, requires_semantic=True, extracted_identifiers=[])
 
-    async def fetch_graph_topology(self, case_id: str) -> List[GraphNodeResult]:
+    async def fetch_graph_topology(self, case_id: str) -> list[GraphNodeResult]:
         """Phase 2: Calculate actual relationship math in Neo4j bounded by Case RBAC."""
         results = []
         cypher = """
@@ -370,7 +365,7 @@ class HybridRetrievalService:
                     ))
         return hydrated
 
-    async def fetch_semantic_chunks(self, query: str, case_id: str) -> List[Dict]:
+    async def fetch_semantic_chunks(self, query: str, case_id: str) -> list[dict]:
         """Phase 4: Fetch context from Qdrant using case_id."""
         query_vector = list(self.embedder.embed([query]))[0].tolist()
         
@@ -466,11 +461,74 @@ async def query_forensic_data(request: QueryRequest):
         response_payload["query"] = request.query
         response_payload["intent_detected"] = context_data.query_intent.dict()
         response_payload["hydrated_identities"] = [e.dict() for e in context_data.hydrated_entities]
+        response_payload["graph_facts"] = [f.dict() for f in context_data.graph_facts]
         
         return response_payload
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Synthesis Engine Failure: {str(e)}")
+    
+@app.get("/api/v1/cases", tags=["Case Management"])
+async def list_cases():
+    """Fetches all unique cases that have been ingested into Neo4j."""
+    try:
+        async with db.neo4j_driver.session() as session:
+            records = await session.run("MATCH (c:Case) RETURN c.case_id AS case_id ORDER BY c.case_id LIMIT 50")
+            cases = [record["case_id"] for record in await records.data()]
+            return {"cases": cases}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"Failed to fetch cases: {str(e)}"})
+
+@app.get("/api/v1/cases/{case_id}/graph", tags=["Case Management"])
+async def get_full_graph(case_id: str):
+    """Fetches the macro topology with full properties for the inspector panel."""
+    cypher = """
+    MATCH (c:Case {case_id: $case_id})-[:OWNS]->(n)
+    OPTIONAL MATCH (n)-[r]->(m)<-[:OWNS]-(c)
+    WHERE type(r) IS NOT NULL AND type(r) <> 'OWNS'
+    RETURN 
+        elementId(n) AS n_id, labels(n)[0] AS n_label, properties(n) AS n_props,
+        type(r) AS rel_type, properties(r) AS rel_props,
+        elementId(m) AS m_id
+    LIMIT 1500
+    """
+    try:
+        async with db.neo4j_driver.session() as session:
+            records = await session.run(cypher, case_id=case_id)
+            data = await records.data()
+            
+            nodes_dict = {}
+            links = []
+            
+            for row in data:
+                # 1. Register Source Node
+                n_id = row["n_id"]
+                if n_id not in nodes_dict:
+                    nodes_dict[n_id] = {
+                        "id": n_id, 
+                        "label": row["n_label"], 
+                        "name": row["n_props"].get("display_name") or row["n_props"].get("e164") or row["n_label"],
+                        "properties": row["n_props"]
+                    }
+                
+                # 2. Register Edge if it exists
+                if row["m_id"]:
+                    links.append({
+                        "source": n_id, 
+                        "target": row["m_id"], 
+                        "label": row["rel_type"],
+                        "properties": row["rel_props"] or {}
+                    })
+            
+            # Color coding based on labels
+            color_map = {"PhoneNumber": "#3b82f6", "Contact": "#10b981", "Message": "#f43f5e", "Call": "#f59e0b", "Device": "#8b5cf6"}
+            for n in nodes_dict.values():
+                n["color"] = color_map.get(n["label"], "#94a3b8")
+
+            return {"nodes": list(nodes_dict.values()), "links": links}
+            
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"Graph retrieval failed: {str(e)}"})
 
 if __name__ == "__main__":
     import uvicorn
