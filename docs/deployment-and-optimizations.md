@@ -162,3 +162,55 @@ We transitioned to pure iterative streaming for all Phase 1 ingestion operations
 We decoupled the LLM logic and implemented a Circuit Breaker pattern.
 * **Provider Interface:** Abstracted the AI synthesis behind an `LLMGatewayInterface`, allowing the backend to swap between Cohere, OpenAI, or local Llama models without altering the core retrieval orchestration.
 * **Graceful Degradation:** Wrapped the LLM implementation in a `CircuitBreakerLLM` class. If the failure threshold (e.g., rate limits) is exceeded, the circuit opens. Instead of throwing a 500 error, the API dynamically drops into "degraded mode," bypassing the synthesis engine and returning the raw, un-synthesized forensic vectors directly to the user so investigations are never fully blocked.
+
+## 12. Idempotent Ingestion Pipeline (Database Layer)
+Initially, the pipeline suffered from "dirty data" bloat because unique constraints were bound to transient `job_id`s, causing every file upload to duplicate database rows, graph nodes, and vector embeddings. This was permanently resolved through a multi-database idempotency architecture:
+
+* **Cryptographic Gateway Rejection:** Implemented a SHA-256 hash filter at the FastAPI endpoint. Files are hashed as they stream to disk. If the hash exists in the `ingested_files` table for a given Case ID, the upload is instantly rejected (`HTTP 409 Conflict`), preventing the Celery worker from wasting compute on redundant data.
+* **PostgreSQL Upserts (`ON CONFLICT`):** Replaced standard `INSERT` statements with `ON CONFLICT (case_id, entity_id) DO UPDATE`. This allows the worker to safely re-process data without throwing `UniqueViolationError` crashes.
+* **Neo4j Graph Convergence:** Shifted from blind `CREATE` statements to strict `MERGE` statements bound by `case_id`. Phantom nodes and duplicate relationships are no longer generated on re-runs.
+* **Deterministic Vector IDs:** Replaced random UUIDs in Qdrant with deterministic UUIDv5 hashes (`case_id` + `thread_id` + `content_text`). Identical text chunks now predictably overwrite themselves rather than exhausting the LLM context window with duplicates.
+
+## 13. Unblocking the Asynchronous Event Loop (Backend Layer)
+File uploads were initially crippling the FastAPI server because cryptographic hashing (`hashlib.sha256`) is a CPU-bound mathematical operation. Running it inline on megabyte chunks blocked the ASGI event loop, preventing the server from handling concurrent network requests.
+
+* **Thread Offloading:** We wrapped the hash update in `asyncio.to_thread(hasher.update, content)`. This pushes the heavy cryptography to a background thread pool, allowing the main async event loop to breathe and handle other HTTP traffic while massive `.ufdr` files stream to disk.
+
+## 14. Severing the Proxy Chokehold (Network Layer)
+In the development environment, React (`localhost:5173`) was using Vite to proxy API requests to FastAPI (`localhost:8000`). This meant gigabyte-scale `.ufdr` files were being buffered through a Node.js middleman, causing severe memory bottlenecks and `ECONNREFUSED` crashes.
+
+* **Direct HTTP Pipeline:** Removed the Vite proxy for API calls and configured Axios to target the FastAPI port directly.
+* **Global CORS Implementation:** Enabled `CORSMiddleware` on the FastAPI application to explicitly permit cross-origin requests from the frontend, ensuring the browser allows the direct connection without security violations.
+
+## 15. Real-Time Telemetry & State Synchronization (Worker/UI Layer)
+The frontend UI was getting stuck in a "Queued" state despite the worker successfully finishing the job. This was caused by an ID mismatch and a lack of granular broadcasting.
+
+* **ID Synchronization:** Forced the internal Celery `task.id` to perfectly match the PostgreSQL `job_id` at dispatch (`task = parse_ufdr_archive.apply_async(..., task_id=job_id)`), ensuring the UI polls the correct identifier.
+* **Granular Broadcasts:** Injected `self.update_state()` broadcasts into the Celery task to report precise pipeline phases (`PARSING`, `SQL_DONE`, `GRAPH_DONE`, `EMBEDDING`).
+* **TypeScript Alignment:** Expanded frontend union types to ingest these exact states, mapping them to the React component to provide investigators with an accurate, real-time progression of the extraction parsing.
+
+## 16. Intent-Based RAG Routing (The Anti-Hallucination Layer)
+
+**Problem:** Early iterations of the Hybrid Retrieval-Augmented Generation (RAG) engine suffered from severe hallucinations. When a user asked an identity-based question (e.g., "Who has multiple names?"), the backend incorrectly executed a hardcoded Graph (Neo4j) macro, returning unrelated phone numbers to the LLM. The LLM, lacking the correct context, hallucinated answers.
+**Optimization:** Replaced the monolithic retrieval script with a **Semantic Intent Router**.
+
+* **Classification:** The user's natural language query is first evaluated by a fast LLM to generate strict boolean routing flags (`requires_sql_identity`, `requires_graph`, `requires_semantic`).
+* **Deterministic Macros:** Rather than letting the LLM write raw, unsafe SQL or Cypher (Agentic Text-to-SQL), the boolean flags trigger highly optimized, parameterized backend Python functions (Macros).
+* **Result:** Identity questions strictly hit PostgreSQL. Topological questions strictly hit Neo4j. This completely eliminated data-retrieval hallucinations and protected the databases from prompt-injection vulnerabilities.
+
+## 17. Multi-Pane State Synchronization & UI Persistence
+
+**Problem:** The forensic dashboard relies on an isolated Chat component and a topological Graph component. Initially, the graph failed to update dynamically when the chat queried new relational data, and the entire visualization was destroyed if the user refreshed the browser.
+**Optimization:** * **State Lifting & Transformation:** Lifted the graph state out of the isolated components and into the parent `DashboardPage`. Implemented a strict JSON transformer within the Chat component that catches `graph_facts` returned by the RAG backend and compiles them into a strict D3-compatible `{ nodes: [], links: [] }` topology, hydrating node colors and properties for the Node Inspector panel.
+
+* **Lazy Initialization & Storage:** Bound the graph's `useState` hook directly to the browser's `sessionStorage`. This ensures that expensive DOM repaints survive page reloads and navigating between routes without forcing the user to re-execute their backend queries.
+
+## 18. Polyglot Persistence: Write-Time Denormalization Strategy
+
+**Problem:** The architecture utilizes Polyglot Persistence: Identities (names/aliases) live in PostgreSQL, while Communication Topologies (call frequency) live in Neo4j. Answering a query like *"How many times did Bob call Alice?"* originally required an expensive "Two-Pass Orchestration Join" (Query Postgres for Bob/Alice's IDs -> Inject IDs into Cypher -> Query Neo4j).
+**Optimization:** Adopted a **Write-Time Denormalization** strategy specifically tailored for immutable forensic data.
+
+* **The Tradeoff:** Because digital evidence is read-heavy and never updated after the initial ingestion, strict Database Normalization rules were intentionally broken.
+* **The Execution:** During the Celery parsing phase, `display_name` properties are duplicated from PostgreSQL and written directly onto the `PhoneNumber` nodes in Neo4j.
+* **The Impact:** This eliminates the cross-database network latency entirely. Complex identity-topology questions are now resolved with a single, high-speed Cypher query (`MATCH (a {name: 'Bob'})-[r]->(b {name: 'Alice'})`), drastically reducing the overall latency of the RAG pipeline.
+

@@ -29,7 +29,7 @@ export const useUploadExtraction = () => {
     mutationFn: async ({ file, caseId }: { file: File; caseId: string }) => {
       const formData = new FormData();
       formData.append('file', file);
-      const response = await axios.post(`/api/v1/extract?case_id=${caseId}`, formData, {
+      const response = await axios.post(`http://localhost:8000/api/v1/extract?case_id=${caseId}`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       return response.data;

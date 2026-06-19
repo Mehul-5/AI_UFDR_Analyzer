@@ -1,13 +1,27 @@
-import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import TopologyGraph from '../components/graph/TopologyGraph';
 import InvestigatorChat from '../components/chat/InvestigatorChat';
+import { useState, useEffect } from 'react';
 
 export default function DashboardPage() {
   const { caseId } = useParams();
   const navigate = useNavigate();
-  const [graphData, setGraphData] = useState({ nodes: [], links: [] });
+
+  const [graphData, setGraphData] = useState(() => {
+    const saved = sessionStorage.getItem(`graph_data_${caseId}`);
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) { return { nodes: [], links: [] }; }
+    }
+    return { nodes: [], links: [] };
+  });
+
+  useEffect(() => {
+    if (caseId && graphData.nodes.length > 0) {
+      sessionStorage.setItem(`graph_data_${caseId}`, JSON.stringify(graphData));
+    }
+  }, [graphData, caseId]);
+  
   const [isLoadingGraph, setIsLoadingGraph] = useState(false);
   const [selectedNode, setSelectedNode] = useState<any>(null);
 

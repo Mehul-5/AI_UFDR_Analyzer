@@ -10,15 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import cohere
 from fastembed import TextEmbedding
 from qdrant_client import models
-from pydantic import ValidationError
 import json
-from worker import celery_app
+
+from worker import celery_app, parse_ufdr_archive
 from config import settings
 from database import db
 from schemas import QueryRequest, QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext
 from telemetry import configure_telemetry
 from llm_service import CohereStrategy, CircuitBreakerLLM
-from worker import parse_ufdr_archive
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,6 +49,7 @@ llm_gateway = CircuitBreakerLLM(strategy=CohereStrategy())
 UPLOAD_DIR = "secure_store"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+
 @app.get("/health", tags=["System"])
 async def health_check():
     return JSONResponse(
@@ -57,11 +57,9 @@ async def health_check():
         content={"status": "online", "project": settings.PROJECT_NAME}
     )
 
+
 @app.post("/api/v1/extract", tags=["Ingestion"])
-async def extract_ufdr(
-    case_id: str,
-    file: UploadFile = File(...)
-):
+async def extract_ufdr(case_id: str, file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.ufdr'):
         raise HTTPException(status_code=400, detail="Invalid file type. Must be a .ufdr archive.")
 
@@ -72,7 +70,6 @@ async def extract_ufdr(
     try:
         async with aiofiles.open(secure_file_path, 'wb') as out_file:
             while content := await file.read(1024 * 1024):  
-                # 🚀 THE FIX: Offload CPU-heavy cryptography to a background thread
                 await asyncio.to_thread(hasher.update, content)
                 await out_file.write(content)
     except Exception as e:
@@ -101,7 +98,6 @@ async def extract_ufdr(
             case_id, file_hash, file.filename
         )
 
-    # Dispatch to Celery worker with matching IDs
     task = parse_ufdr_archive.apply_async(args=[job_id, secure_file_path, case_id], task_id=job_id)
     
     return JSONResponse(
@@ -112,17 +108,18 @@ async def extract_ufdr(
         }
     )
 
+
 @app.get("/api/v1/jobs/{job_id}/status", tags=["Ingestion"])
 async def get_job_status(job_id: str):
     """Fetch the real-time status of the Celery worker."""
     task = celery_app.AsyncResult(job_id)
-    
     return JSONResponse(status_code=200, content={
         "job_id": job_id,
         "status": task.state,
         "error_message": str(task.info) if task.state == 'FAILURE' else None
     })
 
+
 class HybridRetrievalService:
     def __init__(self, database, cohere_cli, embedder):
         self.db = database
@@ -130,12 +127,12 @@ class HybridRetrievalService:
         self.embedder = embedder
 
     async def classify_intent(self, query: str) -> QueryIntent:
-        """Phase 1: Determine what databases need to be queried."""
         prompt = f"""Analyze this forensic query: '{query}'
-        Output a JSON object with:
-        - requires_graph (bool): True if asking for frequency, relationships, 'most contacted', or counts.
-        - requires_semantic (bool): True if asking for conversational context, tone, or specific topics.
-        - extracted_identifiers (list of str): Any explicit phone numbers or names mentioned.
+        Output a JSON object with these boolean flags:
+        - requires_graph: True ONLY if asking for frequency, relationships, or counts of calls/messages.
+        - requires_sql_identity: True if asking about contact names, aliases, anomalies, or who a number is saved as.
+        - requires_semantic: True if asking for conversational context, tone, or specific topics.
+        - extracted_identifiers: Any explicit phone numbers or names mentioned.
         Respond ONLY with valid JSON."""
         
         try:
@@ -143,177 +140,26 @@ class HybridRetrievalService:
             raw_json = response.text.replace('```json', '').replace('```', '').strip()
             return QueryIntent(**json.loads(raw_json))
         except Exception:
-            return QueryIntent(requires_graph=True, requires_semantic=True, extracted_identifiers=[])
+            return QueryIntent(requires_graph=True, requires_sql_identity=True, requires_semantic=True)
 
-    async def fetch_graph_topology(self, case_id: str) -> list[GraphNodeResult]:
-        """Phase 2: Calculate actual relationship math in Neo4j bounded by Case RBAC."""
-        results = []
-        
-        cypher = """
-        MATCH (c:Case {case_id: $case_id})-[:OWNS]->(sender:PhoneNumber)-[:MADE_CALL|SENT_MESSAGE]->(event)-[:RECEIVED_BY]->(receiver:PhoneNumber)<-[:OWNS]-(c)
-        RETURN sender.e164 AS source, receiver.e164 AS target, labels(event)[0] AS rel_type, count(event) AS frequency
-        ORDER BY frequency DESC LIMIT 10
-        """
-        try:
-            async with self.db.neo4j_driver.session() as session:
-                records = await session.run(cypher, case_id=case_id)
-                for record in await records.data():
-                    results.append(GraphNodeResult(
-                        source_number=record["source"],
-                        target_number=record["target"],
-                        interaction_type=record["rel_type"],
-                        frequency=record["frequency"] or 1
-                    ))
-        except Exception as e:
-            print(f"Graph retrieval failed: {e}")
-        return results
-
-    async def hydrate_identities(self, graph_results: list[GraphNodeResult]) -> list[HydratedEntity]:
-        """Phase 3: Batch Hydration (O(1) Network Calls)"""
-        unique_numbers = set()
-        for res in graph_results:
-            unique_numbers.add(res.source_number)
-            unique_numbers.add(res.target_number)
-
-        if not unique_numbers:
-            return []
-
-        hydrated = []
+    async def fetch_identity_anomalies(self, case_id: str) -> list[dict]:
+        """Phase 2A: Relational SQL Macro for Identity Resolution"""
         async with self.db.pg_pool.acquire() as conn:
             query = """
-                SELECT display_name, organization, phone_numbers 
-                FROM contacts 
-                WHERE phone_numbers && $1::text[]
+                SELECT phone, array_agg(DISTINCT display_name) as known_aliases
+                FROM (
+                    SELECT unnest(phone_numbers) as phone, display_name
+                    FROM contacts
+                    WHERE case_id = $1 AND display_name IS NOT NULL
+                ) subquery
+                GROUP BY phone
+                HAVING count(DISTINCT display_name) > 1;
             """
-            rows = await conn.fetch(query, list(unique_numbers))
-
-            for row in rows:
-                db_phones = set(row["phone_numbers"])
-                matched_numbers = unique_numbers.intersection(db_phones)
-                
-                for number in matched_numbers:
-                    hydrated.append(HydratedEntity(
-                        phone_number=number,
-                        display_name=row["display_name"],
-                        organization=row["organization"]
-                    ))
-                    
-        return hydrated
-
-    async def fetch_semantic_chunks(self, query: str, case_id: str) -> list[dict]:
-        """Phase 4: Fetch context from Qdrant using case_id."""
-        query_vector = list(self.embedder.embed([query]))[0].tolist()
-        
-        search_filter = None
-        if case_id:
-            search_filter = models.Filter(
-                must=[models.FieldCondition(key="case_id", match=models.MatchValue(value=case_id))]
-            )
-
-        search_response = await self.db.qdrant_client.query_points(
-            collection_name="forensic_chunks",
-            query=query_vector,
-            using="fast-bge-small-en-v1.5",
-            query_filter=search_filter,
-            limit=5 
-        )
-
-        documents = []
-        for hit in search_response.points:
-            payload = hit.payload
-            documents.append({
-                "id": str(hit.id),
-                "text": payload.get("document", ""),
-                "thread": payload.get("thread_id", "Unknown"),
-                "timeframe": f"{payload.get('start_time')} to {payload.get('end_time')}"
-            })
-        return documents
-
-    async def execute(self, request: QueryRequest) -> dict:
-        """Orchestrates the Hybrid Data Flow."""
-        intent = await self.classify_intent(request.query)
-        
-        context = CompiledRetrievalContext(query_intent=intent)
-
-        if intent.requires_graph:
-            # THIS MUST SAY request.case_id
-            context.graph_facts = await self.fetch_graph_topology(request.case_id)
-            if context.graph_facts:
-                context.hydrated_entities = await self.hydrate_identities(context.graph_facts)
-                
-        if intent.requires_semantic:
-            # THIS MUST ALSO SAY request.case_id
-            context.semantic_chunks = await self.fetch_semantic_chunks(request.query, request.case_id)
-
-        return context
-
-    async def fetch_semantic_chunks(self, query: str, job_id: str) -> list[dict]:
-        """Phase 4: Fetch context from Qdrant."""
-        query_vector = list(self.embedder.embed([query]))[0].tolist()
-        search_filter = None
-        if job_id:
-            search_filter = models.Filter(
-                must=[models.FieldCondition(key="job_id", match=models.MatchValue(value=job_id))]
-            )
-
-        search_response = await self.db.qdrant_client.query_points(
-            collection_name="forensic_chunks",
-            query=query_vector,
-            using="fast-bge-small-en-v1.5",
-            query_filter=search_filter,
-            limit=5 
-        )
-
-        documents = []
-        for hit in search_response.points:
-            payload = hit.payload
-            documents.append({
-                "id": str(hit.id),
-                "text": payload.get("document", ""),
-                "thread": payload.get("thread_id", "Unknown"),
-                "timeframe": f"{payload.get('start_time')} to {payload.get('end_time')}"
-            })
-        return documents
-
-    async def execute(self, request: QueryRequest) -> dict:
-        """Orchestrates the Hybrid Data Flow."""
-        intent = await self.classify_intent(request.query)
-        
-        context = CompiledRetrievalContext(query_intent=intent)
-
-        if intent.requires_graph:
-            context.graph_facts = await self.fetch_graph_topology(request.job_id)
-            if context.graph_facts:
-                context.hydrated_entities = await self.hydrate_identities(context.graph_facts)
-                
-        if intent.requires_semantic:
-            context.semantic_chunks = await self.fetch_semantic_chunks(request.query, request.job_id)
-
-        return context
-class HybridRetrievalService:
-    def __init__(self, database, cohere_cli, embedder):
-        self.db = database
-        self.cohere = cohere_cli
-        self.embedder = embedder
-
-    async def classify_intent(self, query: str) -> QueryIntent:
-        """Phase 1: Determine what databases need to be queried."""
-        prompt = f"""Analyze this forensic query: '{query}'
-        Output a JSON object with:
-        - requires_graph (bool): True if asking for frequency, relationships, 'most contacted', or counts.
-        - requires_semantic (bool): True if asking for conversational context, tone, or specific topics.
-        - extracted_identifiers (list of str): Any explicit phone numbers or names mentioned.
-        Respond ONLY with valid JSON."""
-        
-        try:
-            response = await self.cohere.chat(message=prompt, model="command-r-08-2024")
-            raw_json = response.text.replace('```json', '').replace('```', '').strip()
-            return QueryIntent(**json.loads(raw_json))
-        except Exception:
-            return QueryIntent(requires_graph=True, requires_semantic=True, extracted_identifiers=[])
+            rows = await conn.fetch(query, case_id)
+            return [{"phone": row["phone"], "known_aliases": row["known_aliases"]} for row in rows]
 
     async def fetch_graph_topology(self, case_id: str) -> list[GraphNodeResult]:
-        """Phase 2: Calculate actual relationship math in Neo4j bounded by Case RBAC."""
+        """Phase 2B: Calculate actual relationship math in Neo4j bounded by Case RBAC."""
         results = []
         cypher = """
         MATCH (c:Case {case_id: $case_id})-[:OWNS]->(sender:PhoneNumber)-[:MADE_CALL|SENT_MESSAGE]->(event)-[:RECEIVED_BY]->(receiver:PhoneNumber)<-[:OWNS]-(c)
@@ -394,40 +240,42 @@ class HybridRetrievalService:
             })
         return documents
 
-    async def execute(self, request: QueryRequest) -> dict:
-        """Orchestrates the Hybrid Data Flow."""
+    async def execute(self, request: QueryRequest) -> CompiledRetrievalContext:
+        """Orchestrates the Intent-Based Data Flow."""
         intent = await self.classify_intent(request.query)
-        
         context = CompiledRetrievalContext(query_intent=intent)
 
+        # 1. Fetch Identities (if needed)
+        if intent.requires_sql_identity:
+            context.sql_facts = await self.fetch_identity_anomalies(request.case_id)
+
+        # 2. Fetch Graph Topology (if needed)
         if intent.requires_graph:
             context.graph_facts = await self.fetch_graph_topology(request.case_id)
             if context.graph_facts:
                 context.hydrated_entities = await self.hydrate_identities(context.graph_facts)
                 
+        # 3. Fetch Semantic Texts (if needed)
         if intent.requires_semantic:
             context.semantic_chunks = await self.fetch_semantic_chunks(request.query, request.case_id)
 
         return context
+
 
 @app.post("/api/v1/query", tags=["AI Analysis"])
 async def query_forensic_data(request: QueryRequest):
     """
     Executes a Hybrid Retrieval-Augmented Generation (RAG) query.
     """
-    # 1. Initialize Hybrid Service
     retriever = HybridRetrievalService(db, cohere_client, embedding_model)
-    
-    # 2. Execute Orchestration (This safely fetches from Postgres, Neo4j, and Qdrant)
     context_data = await retriever.execute(request)
     
-    if not context_data.graph_facts and not context_data.semantic_chunks:
+    if not context_data.graph_facts and not context_data.semantic_chunks and not context_data.sql_facts:
         return JSONResponse(
             status_code=404, 
-            content={"message": "No relevant forensic data found in graph or vector indices."}
+            content={"message": "No relevant forensic data found in indices."}
         )
 
-    # 3. Compile the strictly formatted Anti-Hallucination prompt
     system_prompt = f"""## ROLE
         You are an expert Digital Forensics and E-Discovery AI Analyst. Your mandate is to assist human investigators by analyzing extracted mobile device data (chat threads, call records, and forensic metadata).
 
@@ -449,7 +297,6 @@ async def query_forensic_data(request: QueryRequest):
         {context_data.compile_system_prompt()}
         """
 
-    # 4. Route through Circuit Breaker instead of calling Cohere directly
     try:
         response_payload = await llm_gateway.generate_response(
             prompt=request.query,
@@ -457,17 +304,18 @@ async def query_forensic_data(request: QueryRequest):
             documents=context_data.semantic_chunks if context_data.semantic_chunks else []
         )
         
-        # Merge the hydrated identities into the final response payload
         response_payload["query"] = request.query
         response_payload["intent_detected"] = context_data.query_intent.dict()
         response_payload["hydrated_identities"] = [e.dict() for e in context_data.hydrated_entities]
         response_payload["graph_facts"] = [f.dict() for f in context_data.graph_facts]
+        response_payload["sql_facts"] = [s for s in context_data.sql_facts]
         
         return response_payload
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Synthesis Engine Failure: {str(e)}")
     
+
 @app.get("/api/v1/cases", tags=["Case Management"])
 async def list_cases():
     """Fetches all unique cases that have been ingested into Neo4j."""
@@ -478,6 +326,7 @@ async def list_cases():
             return {"cases": cases}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"Failed to fetch cases: {str(e)}"})
+
 
 @app.get("/api/v1/cases/{case_id}/graph", tags=["Case Management"])
 async def get_full_graph(case_id: str):
@@ -501,7 +350,6 @@ async def get_full_graph(case_id: str):
             links = []
             
             for row in data:
-                # 1. Register Source Node
                 n_id = row["n_id"]
                 if n_id not in nodes_dict:
                     nodes_dict[n_id] = {
@@ -511,7 +359,6 @@ async def get_full_graph(case_id: str):
                         "properties": row["n_props"]
                     }
                 
-                # 2. Register Edge if it exists
                 if row["m_id"]:
                     links.append({
                         "source": n_id, 
@@ -520,7 +367,6 @@ async def get_full_graph(case_id: str):
                         "properties": row["rel_props"] or {}
                     })
             
-            # Color coding based on labels
             color_map = {"PhoneNumber": "#3b82f6", "Contact": "#10b981", "Message": "#f43f5e", "Call": "#f59e0b", "Device": "#8b5cf6"}
             for n in nodes_dict.values():
                 n["color"] = color_map.get(n["label"], "#94a3b8")

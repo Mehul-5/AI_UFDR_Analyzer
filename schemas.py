@@ -23,9 +23,14 @@ class QueryRequest(BaseModel):
 # --- HYBRID RAG SCHEMAS ---
 
 class QueryIntent(BaseModel):
-    requires_graph: bool = Field(default=True, description="True if query asks for relationships, frequencies, or counts.")
-    requires_semantic: bool = Field(default=True, description="True if query asks for semantic conversation context.")
-    extracted_identifiers: List[str] = Field(default_factory=list)
+    requires_graph: bool
+    requires_sql_identity: bool = False
+    requires_semantic: bool
+    extracted_identifiers: list[str] = []
+
+class SQLIdentityAnomaly(BaseModel):
+    phone: str
+    known_aliases: list[str]
 
 class GraphNodeResult(BaseModel):
     source_number: str
@@ -40,33 +45,17 @@ class HydratedEntity(BaseModel):
 
 class CompiledRetrievalContext(BaseModel):
     query_intent: QueryIntent
-    graph_facts: List[GraphNodeResult] = []
-    hydrated_entities: List[HydratedEntity] = []
-    semantic_chunks: List[Dict[str, Any]] = []
+    graph_facts: list = []
+    sql_facts: list[SQLIdentityAnomaly] = [] # NEW
+    hydrated_entities: list = []
+    semantic_chunks: list = []
 
     def compile_system_prompt(self) -> str:
-        """
-        This is the anti-hallucination compiler. 
-        It forces the LLM to read the relational truth before the raw vectors.
-        """
-        prompt = "## RETRIEVED FORENSIC CONTEXT\n\n"
-        
-        if self.hydrated_entities:
-            prompt += "### KNOWN IDENTITIES (RELATIONAL TRUTH)\n"
-            for entity in self.hydrated_entities:
-                name = entity.display_name or "Unknown Name"
-                prompt += f"- Number: {entity.phone_number} | Identity: {name} | Org: {entity.organization}\n"
-            prompt += "\n"
-        
+        prompt = ""
+        if self.sql_facts:
+            prompt += f"\n[IDENTITY ANOMALIES FOUND]\n{self.sql_facts}"
         if self.graph_facts:
-            prompt += "### COMMUNICATION TOPOLOGY (GRAPH FREQUENCIES)\n"
-            for fact in self.graph_facts:
-                prompt += f"- {fact.source_number} {fact.interaction_type} {fact.target_number} ({fact.frequency} times)\n"
-            prompt += "\n"
-
+            prompt += f"\n[COMMUNICATION TOPOLOGY]\n{self.graph_facts}"
         if self.semantic_chunks:
-            prompt += "### RELEVANT CHAT TRANSCRIPTS (VECTOR SEARCH)\n"
-            for chunk in self.semantic_chunks:
-                prompt += f"--- Thread: {chunk['thread']} | Time: {chunk['timeframe']} ---\n{chunk['text']}\n\n"
-        
+            prompt += f"\n[SEMANTIC CHUNKS]\n{self.semantic_chunks}"
         return prompt
