@@ -61,3 +61,7 @@ class CompiledRetrievalContext(BaseModel):
         if self.semantic_chunks:
             prompt += f"\n[SEMANTIC CHUNKS]\n{self.semantic_chunks}"
         return prompt
+    
+class UserCreate(BaseModel):
+    username: str
+    password: str

@@ -41,5 +41,16 @@ class Settings(BaseSettings):
     # Tell Pydantic to read from the .env file
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
+    # llm
+    COHERE_API_KEY: str
+
+    # WT Authentication
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+
+    # Tell Pydantic to read from the .env file
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+
 # Instantiate the settings object to be imported across the app
 settings = Settings()

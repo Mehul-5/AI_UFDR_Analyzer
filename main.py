@@ -14,7 +14,7 @@ import json
 from worker import celery_app, parse_ufdr_archive
 from config import settings
 from database import db
-from schemas import QueryRequest, QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext
+from schemas import QueryRequest, QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext, UserCreate
 from telemetry import configure_telemetry
 from llm_service import CohereStrategy, CircuitBreakerLLM
 import boto3
@@ -23,6 +23,9 @@ import redis.asyncio as aioredis
 from fastapi import Request
 import re
 from opentelemetry.propagate import inject
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import Depends
+from auth import get_current_user, verify_password, create_access_token, get_password_hash
 
 s3_client = boto3.client(
     's3', 
@@ -75,9 +78,42 @@ async def health_check():
         content={"status": "online", "project": settings.PROJECT_NAME}
     )
 
+@app.post("/api/v1/auth/register", tags=["Authentication"])
+async def register_user(user_data: UserCreate):
+    async with db.pg_pool.acquire() as conn:
+        # 1. Check if username is already taken
+        existing_user = await conn.fetchrow("SELECT id FROM users WHERE username = $1", user_data.username)
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Operator ID is already registered.")
+        
+        # 2. Hash the password securely with bcrypt
+        hashed_pw = get_password_hash(user_data.password)
+        
+        # 3. Save the new investigator
+        await conn.execute(
+            "INSERT INTO users (username, hashed_password) VALUES ($1, $2)",
+            user_data.username, hashed_pw
+        )
+        
+    return JSONResponse(status_code=201, content={"message": "Operator account created successfully. Please log in."})
+
+@app.post("/api/v1/auth/token", tags=["Authentication"])
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    async with db.pg_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT username, hashed_password FROM users WHERE username = $1", form_data.username)
+        
+        if not user or not verify_password(form_data.password, user["hashed_password"]):
+            raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/api/v1/extract", tags=["Ingestion"])
-async def extract_ufdr(case_id: str, file: UploadFile = File(...)):
+async def extract_ufdr(
+    case_id: str, 
+    file: UploadFile = File(...), 
+    current_user: str = Depends(get_current_user)
+):
     if not file.filename.lower().endswith('.ufdr'):
         raise HTTPException(status_code=400, detail="Invalid file type. Must be a .ufdr archive.")
 

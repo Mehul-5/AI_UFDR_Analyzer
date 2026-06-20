@@ -1,10 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import axios from 'axios';
+import api from '../../services/api';
 
 interface Message {
-  role: 'investigator' | 'ai';
+  role: 'investigator' | 'ai' | 'system';
   content: string;
   isError?: boolean;
+  sources?: any[];
 }
 
 const SUGGESTED_QUERIES = [
@@ -34,30 +35,47 @@ export default function InvestigatorChat({ caseId, onGraphUpdate }: { caseId: st
     setInput('');
     setIsLoading(true);
 
+    const startTime = performance.now();
+    console.log(`\n[Hybrid Context Engine] Executing Forensic Query for Case [${caseId}]: "${queryText}"`);
+
     try {
-      const response = await axios.post('/api/v1/query', {
+      const response = await api.post('/api/v1/query', {
         query: queryText,
-        case_id: caseId
+        case_id: caseId,
+        request_id: crypto.randomUUID(),
+        client_timestamp: new Date().toISOString()
       });
 
       const data = response.data;
+      const latency = performance.now() - startTime;
 
-      // Update Chat
-      setMessages(prev => [...prev, { role: 'ai', content: data.answer }]);
+      console.log(`[Hybrid Context Engine] Query Resolved in ${latency.toFixed(2)}ms. Payload:`, data);
 
-      // Update Graph if the backend generated a topology
+      if (data.status === 'partial' || data.anti_hallucination_controls?.sources_passed_to_llm === 0) {
+        console.warn("[Hybrid Context Engine] System degraded or sources missing. Displaying partial retrieval results.");
+        setMessages(prev => [...prev, {
+          role: 'system',
+          content: 'SYSTEM WARNING: Semantic search degraded or no definitive sources found. Results may be based strictly on structural database queries or partial data.'
+        }]);
+      }
+
+      setMessages(prev => [...prev, { 
+        role: 'ai', 
+        content: data.answer.text || data.answer,
+        sources: data.retrieved_sources 
+      }]);
+
       if (data.graph_facts && data.graph_facts.length > 0) {
         const nodes: any = {};
         const links: any = [];
 
-        // Hydrate graph with backend data
         data.hydrated_identities?.forEach((entity: any) => {
           nodes[entity.phone_number] = {
             id: entity.phone_number,
             label: "Contact",
             name: entity.display_name,
             properties: { ...entity },
-            color: "#10b981" // Green for hydrated contacts
+            color: "#10b981" 
           };
         });
 
@@ -77,8 +95,14 @@ export default function InvestigatorChat({ caseId, onGraphUpdate }: { caseId: st
       }
 
     } catch (error: any) {
-      console.error("Query failed:", error);
-      setMessages(prev => [...prev, { role: 'ai', content: `Error: ${error.message}`, isError: true }]);
+      const latency = performance.now() - startTime;
+      console.error(`[Hybrid Context Engine] Query Failed after ${latency.toFixed(2)}ms:`, error);
+      
+      setMessages(prev => [...prev, { 
+        role: 'system', 
+        content: `CRITICAL ERROR: Retrieval pipeline failure. ${error.response?.data?.detail || error.message}`, 
+        isError: true 
+      }]);
     } finally {
       setIsLoading(false);
     }
@@ -99,18 +123,22 @@ export default function InvestigatorChat({ caseId, onGraphUpdate }: { caseId: st
           <div key={idx} className={`p-3 rounded-lg text-sm shadow-sm ${
             msg.role === 'investigator' 
               ? 'bg-[#E2E8F0] text-[#1E293B] ml-6 border border-[#CBD5E1]' 
-              : msg.isError 
-                ? 'bg-[#FEF2F2] text-[#DC2626] border border-[#FECACA] mr-6'
-                : 'bg-[#FFFFFF] text-[#334155] border border-[#E2E8F0] mr-6'
+              : msg.role === 'system'
+                ? 'bg-[#FEF9C3] text-[#A16207] border border-[#FEF08A] mx-4 text-center font-semibold text-xs' // System warnings style
+                : msg.isError 
+                  ? 'bg-[#FEF2F2] text-[#DC2626] border border-[#FECACA] mr-6'
+                  : 'bg-[#FFFFFF] text-[#334155] border border-[#E2E8F0] mr-6'
           }`}>
-            <span className="block text-[10px] font-bold uppercase mb-1 tracking-wider text-[#94A3B8]">
-              {msg.role}
-            </span>
+            {msg.role !== 'system' && (
+              <span className="block text-[10px] font-bold uppercase mb-1 tracking-wider text-[#94A3B8]">
+                {msg.role}
+              </span>
+            )}
             <div className="whitespace-pre-wrap">{msg.content}</div>
           </div>
         ))}
         {isLoading && (
-          <div className="p-3 bg-[#FFFFFF] border border-[#E2E8F0] rounded-lg mr-6 w-24">
+          <div className="p-3 bg-[#FFFFFF] border border-[#E2E8F0] rounded-lg mr-6 w-24 shadow-sm">
             <span className="text-sm text-[#94A3B8] font-mono animate-pulse">Analyzing...</span>
           </div>
         )}

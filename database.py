@@ -18,12 +18,31 @@ class DatabaseManager:
     async def init_models(self):
         """
         Creates the PostgreSQL schema if it does not exist.
-        Now includes a table specifically for File Hash Deduplication.
+        Includes File Hash Deduplication and User Authentication tables.
         """
         logger.info("Verifying PostgreSQL schema...")
         async with self.pg_pool.acquire() as conn:
+            
+            # 1. Create Users Table for JWT Auth
             await conn.execute("""
-                -- NEW: Table to track file hashes and prevent duplicate uploads
+                CREATE TABLE IF NOT EXISTS users (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    username TEXT UNIQUE NOT NULL,
+                    hashed_password TEXT NOT NULL
+                );
+            """)
+
+            # 2. Inject Default Admin User (Password: admin123)
+            from auth import get_password_hash
+            default_hash = get_password_hash("admin123")
+            await conn.execute("""
+                INSERT INTO users (username, hashed_password)
+                VALUES ('admin', $1)
+                ON CONFLICT (username) DO NOTHING;
+            """, default_hash)
+
+            # 3. Create Forensic Tables
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS ingested_files (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     case_id TEXT NOT NULL,
@@ -74,7 +93,7 @@ class DatabaseManager:
                     UNIQUE(case_id, message_id)
                 );
             """)
-        logger.info("✅ PostgreSQL schema verified with Idempotent Constraints.")
+        logger.info(" PostgreSQL schema verified with Idempotent Constraints.")
 
     async def connect(self):
         logger.info("Initializing database connections...")

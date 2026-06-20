@@ -8,6 +8,11 @@ export default function DashboardPage() {
   const { caseId } = useParams();
   const navigate = useNavigate();
 
+  const handleLogout = () => {
+    localStorage.removeItem('auth_token');
+    navigate('/login');
+  };
+
   const [graphData, setGraphData] = useState(() => {
     const saved = sessionStorage.getItem(`graph_data_${caseId}`);
     if (saved) {
@@ -29,14 +34,12 @@ export default function DashboardPage() {
 
   const loadMacroGraph = async () => {
     setIsLoadingGraph(true);
-    console.log(` Fetching Macro Graph Topology for Case: ${caseId}...`);
     try {
       const res = await axios.get(`/api/v1/cases/${caseId}/graph`);
-      console.log(` Macro Graph Loaded. Nodes: ${res.data.nodes.length}, Edges: ${res.data.links.length}`);
       setGraphData(res.data);
       setSelectedNode(null);
     } catch (error) {
-      console.error(" Failed to load macro graph:", error);
+      console.error("Failed to load macro graph:", error);
     } finally {
       setIsLoadingGraph(false);
     }
@@ -45,25 +48,31 @@ export default function DashboardPage() {
   return (
     <div className="flex flex-col h-screen bg-[#F8FAFC] font-sans">
       
-      {/* GLOBAL HEADER (Ink) */}
       <header className="bg-[#1E293B] shadow-md z-20 shrink-0">
-        <div className="px-4 sm:px-6 flex justify-between items-center h-14">
-          <h1 className="text-lg font-extrabold text-[#FFFFFF] tracking-tight">
+        <div className="px-6 flex justify-between items-center h-16">
+          <h1 className="text-xl font-extrabold text-[#FFFFFF] tracking-tight">
             AI-UFDR<span className="text-[#C2761B]">Analyzer</span>
           </h1>
-          <button 
-            onClick={() => navigate('/')}
-            className="text-xs font-bold bg-[#334155] hover:bg-[#64748B] text-[#FFFFFF] py-1.5 px-4 rounded transition-colors"
-          >
-            ← Back to Extraction Menu
-          </button>
+          
+          <div className="flex space-x-3">
+            <button 
+              onClick={() => navigate('/')}
+              className="text-sm font-bold bg-[#334155] hover:bg-[#475569] text-[#FFFFFF] py-2 px-4 rounded transition-colors"
+            >
+              ← Back to Extraction Menu
+            </button>
+            <button 
+              onClick={handleLogout}
+              className="text-sm font-bold bg-[#334155] hover:bg-[#9B2C2C] text-[#FFFFFF] py-2 px-4 rounded transition-colors shadow-sm"
+            >
+              End Session
+            </button>
+          </div>
         </div>
       </header>
 
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
         
-        {/* LEFT PANE: AI Chat */}
-        {/* Changed w-1/3 to w-full on mobile, md:w-1/3 on desktop. Added border-b for mobile stacking. */}
         <div className="w-full md:w-1/3 md:max-w-md h-[45vh] md:h-full flex flex-col border-b md:border-b-0 md:border-r border-[#CBD5E1] bg-[#F8FAFC] z-10 shrink-0">
           <div className="p-3 border-b border-[#E2E8F0] bg-[#FFFFFF] shrink-0">
             <h2 className="text-sm font-bold text-[#1E293B] uppercase tracking-wider">Active Case: <span className="text-[#C2761B]">{caseId}</span></h2>
@@ -73,7 +82,6 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* RIGHT PANE: Graph Area */}
         <div className="w-full md:flex-1 h-[55vh] md:h-full flex flex-col relative bg-[#E2E8F0]">
           <div className="p-3 flex justify-between items-center border-b border-[#CBD5E1] shrink-0 bg-[#FFFFFF] z-10">
             <h2 className="text-sm font-bold text-[#1E293B] uppercase tracking-wider">Forensic Topology</h2>
@@ -89,7 +97,6 @@ export default function DashboardPage() {
             <TopologyGraph data={graphData} onNodeSelect={setSelectedNode} />
           </div>
 
-          {/* NODE INSPECTOR PANEL */}
           {selectedNode && (
             <div className="absolute top-4 right-4 md:bottom-4 w-72 md:w-80 max-h-[80%] bg-[#FFFFFF] rounded shadow-2xl border border-[#CBD5E1] flex flex-col z-20 overflow-hidden">
               <div className="p-3 bg-[#1E293B] flex justify-between items-center text-[#FFFFFF] shrink-0">
