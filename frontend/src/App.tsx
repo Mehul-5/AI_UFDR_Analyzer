@@ -1,19 +1,23 @@
 import { Routes, Route } from 'react-router-dom';
-import UploadPage from './pages/UploadPage';
+import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
-import { JobProvider } from './context/JobContext';
-import { GlobalJobTracker } from './components/GlobalJobTracker';
+import UploadPage from './pages/UploadPage';
+import ProtectedRoute from './components/auth/ProtectedRoute';
+import { JobProvider } from './context/JobContext'; 
 
 export default function App() {
   return (
     <JobProvider>
       <Routes>
-        <Route path="/" element={<UploadPage />} />
-        <Route path="/dashboard/:caseId" element={<DashboardPage />} />
+        {/* Public Routes */}
+        <Route path="/login" element={<LoginPage />} />
+
+        <Route element={<ProtectedRoute />}>
+          <Route path="/" element={<UploadPage />} /> 
+          
+          <Route path="/dashboard/:caseId" element={<DashboardPage />} />
+        </Route>
       </Routes>
-      
-      {/* This renders the Toasts globally, regardless of which Route is active */}
-      <GlobalJobTracker />
     </JobProvider>
   );
 }
