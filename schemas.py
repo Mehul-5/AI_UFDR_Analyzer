@@ -27,6 +27,7 @@ class QueryIntent(BaseModel):
     requires_sql_identity: bool = False
     requires_semantic: bool
     extracted_identifiers: list[str] = []
+    optimized_search_queries: list[str] = []
 
 class SQLIdentityAnomaly(BaseModel):
     phone: str
@@ -37,6 +38,7 @@ class GraphNodeResult(BaseModel):
     target_number: str
     interaction_type: str
     frequency: int
+    interaction_times: list[str] = []
 
 class HydratedEntity(BaseModel):
     phone_number: str
