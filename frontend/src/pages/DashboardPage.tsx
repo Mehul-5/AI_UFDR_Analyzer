@@ -60,28 +60,28 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      {/* SPLIT PANE BODY */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
         
-        {/* LEFT PANE: AI Chat (Mist & Paper) */}
-        <div className="w-1/3 flex flex-col border-r border-[#CBD5E1] bg-[#F8FAFC] z-10">
+        {/* LEFT PANE: AI Chat */}
+        {/* Changed w-1/3 to w-full on mobile, md:w-1/3 on desktop. Added border-b for mobile stacking. */}
+        <div className="w-full md:w-1/3 md:max-w-md h-[45vh] md:h-full flex flex-col border-b md:border-b-0 md:border-r border-[#CBD5E1] bg-[#F8FAFC] z-10 shrink-0">
           <div className="p-3 border-b border-[#E2E8F0] bg-[#FFFFFF] shrink-0">
             <h2 className="text-sm font-bold text-[#1E293B] uppercase tracking-wider">Active Case: <span className="text-[#C2761B]">{caseId}</span></h2>
           </div>
-          <div className="flex-1 p-4 overflow-hidden">
+          <div className="flex-1 p-4 overflow-hidden flex flex-col">
             <InvestigatorChat caseId={caseId} onGraphUpdate={setGraphData} />
           </div>
         </div>
 
         {/* RIGHT PANE: Graph Area */}
-        <div className="flex-1 flex flex-col relative bg-[#E2E8F0]">
+        <div className="w-full md:flex-1 h-[55vh] md:h-full flex flex-col relative bg-[#E2E8F0]">
           <div className="p-3 flex justify-between items-center border-b border-[#CBD5E1] shrink-0 bg-[#FFFFFF] z-10">
             <h2 className="text-sm font-bold text-[#1E293B] uppercase tracking-wider">Forensic Topology</h2>
             <button 
               onClick={loadMacroGraph} disabled={isLoadingGraph}
               className="bg-[#C2761B] hover:bg-[#AD7B45] text-[#FFFFFF] text-xs font-bold py-1.5 px-4 rounded transition-colors shadow-sm disabled:opacity-50"
             >
-              {isLoadingGraph ? 'Loading...' : 'Load Complete Case Graph'}
+              {isLoadingGraph ? 'Loading...' : 'Load Complete Graph'}
             </button>
           </div>
           
@@ -91,7 +91,7 @@ export default function DashboardPage() {
 
           {/* NODE INSPECTOR PANEL */}
           {selectedNode && (
-            <div className="absolute top-4 right-4 bottom-4 w-80 bg-[#FFFFFF] rounded shadow-2xl border border-[#CBD5E1] flex flex-col z-20 overflow-hidden">
+            <div className="absolute top-4 right-4 md:bottom-4 w-72 md:w-80 max-h-[80%] bg-[#FFFFFF] rounded shadow-2xl border border-[#CBD5E1] flex flex-col z-20 overflow-hidden">
               <div className="p-3 bg-[#1E293B] flex justify-between items-center text-[#FFFFFF] shrink-0">
                 <span className="font-bold text-sm tracking-wider">Node Inspector</span>
                 <button onClick={() => setSelectedNode(null)} className="text-[#94A3B8] hover:text-[#FFFFFF] font-bold text-lg leading-none">&times;</button>

@@ -9,7 +9,7 @@ export default function App() {
     <JobProvider>
       <Routes>
         <Route path="/" element={<UploadPage />} />
-        <Route path="/case/:caseId" element={<DashboardPage />} />
+        <Route path="/dashboard/:caseId" element={<DashboardPage />} />
       </Routes>
       
       {/* This renders the Toasts globally, regardless of which Route is active */}

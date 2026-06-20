@@ -1,23 +1,41 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useJobs } from '../context/JobContext';
-import { useJobPolling } from '../api/hooks';
 
 const JobToast: React.FC<{ jobId: string }> = ({ jobId }) => {
   const { removeJob } = useJobs();
-  const { data: jobStatus, isError } = useJobPolling(jobId);
+  const [jobStatus, setJobStatus] = useState<any>({ status: 'CONNECTING...' });
 
   useEffect(() => {
-    if (jobStatus?.status === 'SUCCESS' || jobStatus?.status === 'FAILED' || isError) {
-      // Delay removal so the user can see the final status before it disappears
-      const timer = setTimeout(() => {
-        removeJob(jobId);
-      }, 5000); 
-      return () => clearTimeout(timer);
-    }
-  }, [jobStatus?.status, isError, jobId, removeJob]);
+    // Open a persistent Server-Sent Events connection
+    const sse = new EventSource(`http://localhost:8000/api/v1/jobs/${jobId}/stream`);
+    
+    sse.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      console.log(
+        `%c[CELERY WORKER - Job ${jobId}]`, 'color: #C2761B; font-weight: bold;', 
+        `\nPhase: ${data.phase || 'INIT'}\nStatus: ${data.status}\nMessage: ${data.error_message || 'Processing...'}`
+      );
+      
+      setJobStatus(data);
+      
+      if (data.status === 'SUCCESS' || data.status === 'FAILED') {
+        sse.close();
+        setTimeout(() => removeJob(jobId), 5000); 
+      }
+    };
+
+    sse.onerror = () => {
+      setJobStatus({ status: 'CONNECTION_LOST', error_message: 'Lost connection to worker stream.' });
+      sse.close();
+    };
+
+    return () => sse.close(); // Cleanup on unmount
+  }, [jobId, removeJob]);
 
   const isComplete = jobStatus?.status === 'SUCCESS';
-  const isFailed = jobStatus?.status === 'FAILED' || isError;
+  // FIX: We no longer have `isError` from react-query. We evaluate the status string directly.
+  const isFailed = jobStatus?.status === 'FAILED' || jobStatus?.status === 'CONNECTION_LOST';
 
   return (
     <div className={`bg-white border-l-4 shadow-lg p-4 rounded mb-3 w-80 transition-all ${

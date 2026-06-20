@@ -1,6 +1,20 @@
 version: "3.9"
 
 services:
+
+  minio:
+    image: minio/minio
+    container_name: ufdr-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
   postgres:
     image: postgres:16
     container_name: ufdr-postgres
@@ -76,3 +90,4 @@ volumes:
   neo4j_data:
   qdrant_data:
   redis_data:
+  minio_data:

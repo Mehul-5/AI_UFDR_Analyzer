@@ -1,6 +1,12 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+
+    # MinIO / S3 Configuration
+    MINIO_ENDPOINT: str = "http://localhost:9000" # Use "http://minio:9000" if running FastAPI in docker
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin123"
+    MINIO_BUCKET: str = "ufdr-extractions"
     
     PROJECT_NAME: str = "UFDR Forensic Analyzer"
     VERSION: str = "1.0.0"

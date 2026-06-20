@@ -1,112 +1,153 @@
-import { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 
-interface ChatMessage {
-  role: 'user' | 'system';
+interface Message {
+  role: 'investigator' | 'ai';
   content: string;
-  citations?: any[];
-  identities?: any[];
+  isError?: boolean;
 }
 
-export default function InvestigatorChat({ caseId, onGraphUpdate }: { caseId: string, onGraphUpdate: (data: any) => void }) {
+const SUGGESTED_QUERIES = [
+  "List every phone number with no associated display name.",
+  "Are there any discussions indicating financial distress?",
+  "Who does the device owner communicate with most frequently?",
+  "Show me discussions about meeting locations or coordinates.",
+  "Find messages where the tone shifts from friendly to threatening."
+];
+
+export default function InvestigatorChat({ caseId, onGraphUpdate }: { caseId: string, onGraphUpdate: any }) {
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const saved = sessionStorage.getItem(`chat_history_${caseId}`);
-    return saved ? JSON.parse(saved) : [];
-  });
-  const [isQuerying, setIsQuerying] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), [messages]);
-  useEffect(() => sessionStorage.setItem(`chat_history_${caseId}`, JSON.stringify(messages)), [messages, caseId]);
+  // Auto-scroll to bottom of chat
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
-  const handleQuery = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim()) return;
+  const handleQuery = async (queryText: string) => {
+    if (!queryText.trim()) return;
 
-    console.log(` Executing Forensic Query for Case [${caseId}]: "${input}"`);
-
-    const newMessages = [...messages, { role: 'user' as const, content: input }];
-    setMessages(newMessages);
+    const userMessage: Message = { role: 'investigator', content: queryText };
+    setMessages(prev => [...prev, userMessage]);
     setInput('');
-    setIsQuerying(true);
+    setIsLoading(true);
 
     try {
-      const response = await axios.post('/api/v1/query', { query: input, case_id: caseId });
+      const response = await axios.post('/api/v1/query', {
+        query: queryText,
+        case_id: caseId
+      });
+
       const data = response.data;
 
-      console.log(" Query Resolved. Hybrid Context Engine Data:", data);
+      // Update Chat
+      setMessages(prev => [...prev, { role: 'ai', content: data.answer }]);
 
-      // STRICT GRAPH TRANSFORMATION
+      // Update Graph if the backend generated a topology
       if (data.graph_facts && data.graph_facts.length > 0) {
-        const nodes: any[] = [];
-        const links: any[] = [];
-        const nodeMap = new Set();
-        
+        const nodes: any = {};
+        const links: any = [];
+
+        // Hydrate graph with backend data
+        data.hydrated_identities?.forEach((entity: any) => {
+          nodes[entity.phone_number] = {
+            id: entity.phone_number,
+            label: "Contact",
+            name: entity.display_name,
+            properties: { ...entity },
+            color: "#10b981" // Green for hydrated contacts
+          };
+        });
+
         data.graph_facts.forEach((fact: any) => {
-          const sourceEntity = data.hydrated_identities?.find((e: any) => e.phone_number === fact.source_number);
-          const targetEntity = data.hydrated_identities?.find((e: any) => e.phone_number === fact.target_number);
+          if (!nodes[fact.source_number]) nodes[fact.source_number] = { id: fact.source_number, label: "PhoneNumber", name: fact.source_number, color: "#3b82f6" };
+          if (!nodes[fact.target_number]) nodes[fact.target_number] = { id: fact.target_number, label: "PhoneNumber", name: fact.target_number, color: "#3b82f6" };
           
-          if (!nodeMap.has(fact.source_number)) {
-            nodes.push({ 
-              id: fact.source_number, 
-              label: 'PhoneNumber',
-              name: sourceEntity?.display_name || fact.source_number, 
-              color: sourceEntity ? '#10b981' : '#3b82f6',
-              // Add properties so the Node Inspector actually works
-              properties: { e164: fact.source_number, display_name: sourceEntity?.display_name, organization: sourceEntity?.organization }
-            });
-            nodeMap.add(fact.source_number);
-          }
-          if (!nodeMap.has(fact.target_number)) {
-            nodes.push({ 
-              id: fact.target_number, 
-              label: 'PhoneNumber',
-              name: targetEntity?.display_name || fact.target_number, 
-              color: targetEntity ? '#10b981' : '#3b82f6',
-              properties: { e164: fact.target_number, display_name: targetEntity?.display_name, organization: targetEntity?.organization }
-            });
-            nodeMap.add(fact.target_number);
-          }
-          links.push({ 
-            source: fact.source_number, 
-            target: fact.target_number, 
+          links.push({
+            source: fact.source_number,
+            target: fact.target_number,
             label: fact.interaction_type,
             properties: { frequency: fact.frequency }
           });
         });
-        
-        onGraphUpdate({ nodes, links });
+
+        onGraphUpdate({ nodes: Object.values(nodes), links });
       }
 
-      setMessages([...newMessages, { role: 'system', content: data.answer || data.text || "Analysis complete.", identities: data.hydrated_identities }]);
     } catch (error: any) {
-      setMessages([...newMessages, { role: 'system', content: `Error: ${error.response?.data?.detail || error.message}` }]);
+      console.error("Query failed:", error);
+      setMessages(prev => [...prev, { role: 'ai', content: `Error: ${error.message}`, isError: true }]);
     } finally {
-      setIsQuerying(false);
+      setIsLoading(false);
     }
   };
 
   return (
-    <div className="flex flex-col h-full min-h-0 bg-[#FFFFFF] rounded-lg shadow-sm border border-[#E2E8F0]">
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+    <div className="flex flex-col h-full w-full">
+      {/* CHAT MESSAGES AREA */}
+      <div className="flex-1 overflow-y-auto mb-4 pr-2 space-y-4">
+        {messages.length === 0 && (
+          <div className="text-center text-[#64748B] text-sm mt-10">
+            <p className="font-bold">AI Analysis Engine Ready.</p>
+            <p>Select a suggested query or type your own.</p>
+          </div>
+        )}
+        
         {messages.map((msg, idx) => (
-          <div key={idx} className={`p-3 rounded-lg text-sm shadow-sm border ${msg.role === 'user' ? 'bg-[#E2E8F0] border-[#CBD5E1] text-[#1E293B] ml-8' : 'bg-[#F8FAFC] border-[#E2E8F0] text-[#334155] mr-8'}`}>
-            <div className="font-bold mb-1 text-xs text-[#64748B] uppercase tracking-wider">{msg.role === 'user' ? 'Investigator' : 'AI Analysis'}</div>
+          <div key={idx} className={`p-3 rounded-lg text-sm shadow-sm ${
+            msg.role === 'investigator' 
+              ? 'bg-[#E2E8F0] text-[#1E293B] ml-6 border border-[#CBD5E1]' 
+              : msg.isError 
+                ? 'bg-[#FEF2F2] text-[#DC2626] border border-[#FECACA] mr-6'
+                : 'bg-[#FFFFFF] text-[#334155] border border-[#E2E8F0] mr-6'
+          }`}>
+            <span className="block text-[10px] font-bold uppercase mb-1 tracking-wider text-[#94A3B8]">
+              {msg.role}
+            </span>
             <div className="whitespace-pre-wrap">{msg.content}</div>
           </div>
         ))}
-        {isQuerying && <div className="text-sm text-[#94A3B8] italic animate-pulse p-2">Running Hybrid Search...</div>}
+        {isLoading && (
+          <div className="p-3 bg-[#FFFFFF] border border-[#E2E8F0] rounded-lg mr-6 w-24">
+            <span className="text-sm text-[#94A3B8] font-mono animate-pulse">Analyzing...</span>
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
-      <form onSubmit={handleQuery} className="flex gap-2 p-3 border-t border-[#E2E8F0] bg-[#F8FAFC] shrink-0 rounded-b-lg">
-        <input 
-          type="text" value={input} onChange={(e) => setInput(e.target.value)} disabled={isQuerying}
-          className="flex-1 bg-[#FFFFFF] border border-[#CBD5E1] rounded p-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#C2761B]" 
-          placeholder="Ask about the evidence..." 
+      <div className="mb-2 flex overflow-x-auto pb-2 space-x-2 scrollbar-thin scrollbar-thumb-[#CBD5E1]">
+        {SUGGESTED_QUERIES.map((q, idx) => (
+          <button
+            key={idx}
+            onClick={() => handleQuery(q)}
+            disabled={isLoading}
+            className="shrink-0 bg-[#FFFFFF] border border-[#CBD5E1] hover:border-[#C2761B] text-[#475569] hover:text-[#C2761B] text-xs py-1.5 px-3 rounded-full transition-colors whitespace-nowrap disabled:opacity-50"
+          >
+            {q}
+          </button>
+        ))}
+      </div>
+
+      {/* INPUT FORM */}
+      <form 
+        onSubmit={(e) => { e.preventDefault(); handleQuery(input); }} 
+        className="flex space-x-2 shrink-0"
+      >
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask about the evidence..."
+          disabled={isLoading}
+          className="flex-1 p-2 text-sm border border-[#CBD5E1] rounded focus:outline-none focus:ring-2 focus:ring-[#C2761B] disabled:bg-[#F1F5F9]"
         />
-        <button type="submit" disabled={isQuerying || !input.trim()} className="bg-[#C2761B] text-[#FFFFFF] px-4 py-2 rounded text-sm font-bold disabled:opacity-50">
+        <button 
+          type="submit" 
+          disabled={isLoading || !input.trim()}
+          className="bg-[#C2761B] hover:bg-[#AD7B45] text-[#FFFFFF] font-bold py-2 px-4 rounded text-sm transition-colors disabled:opacity-50"
+        >
           Query
         </button>
       </form>
