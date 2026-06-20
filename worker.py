@@ -1,3 +1,4 @@
+import tempfile
 from celery import Celery
 import logging
 import zipfile
@@ -11,11 +12,33 @@ import uuid
 from datetime import datetime
 from neo4j import AsyncGraphDatabase
 from qdrant_client import QdrantClient
+import qdrant_client
 from config import settings
 from celery.signals import worker_process_init
 from telemetry import configure_telemetry
 from opentelemetry import trace
 import ijson
+import redis
+import boto3
+import os
+from qdrant_client import models
+from database import db
+from celery.signals import worker_process_init, task_prerun, task_postrun
+from opentelemetry.propagate import extract
+from opentelemetry import context as otel_context
+
+redis_publisher = redis.from_url(settings.REDIS_URL)
+s3_worker_client = boto3.client(
+    's3', 
+    endpoint_url=settings.MINIO_ENDPOINT,
+    aws_access_key_id=settings.MINIO_ACCESS_KEY,
+    aws_secret_access_key=settings.MINIO_SECRET_KEY
+)
+
+def broadcast_update(job_id, status, phase=None, error=None):
+    """Pushes real-time updates directly to the FastAPI SSE stream."""
+    payload = {"job_id": job_id, "status": status, "phase": phase, "error_message": error}
+    redis_publisher.publish(f"job_{job_id}", json.dumps(payload))
 
 tracer = trace.get_tracer(__name__)
 logger = logging.getLogger(__name__)
@@ -40,6 +63,32 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1
 )
+
+@task_prerun.connect
+def setup_distributed_tracing(task_id, task, *args, **kwargs):
+    try:
+        # Grab the headers from the Celery message
+        headers = task.request.headers or {}
+        
+        # W3C Context Extraction: Translates 'traceparent' string back into an active Context
+        parent_context = extract(headers)
+        
+        # Attach the context to the current thread/worker
+        token = otel_context.attach(parent_context)
+        
+        # Save the token to safely detach it later
+        task.request.otel_token = token
+        
+    except Exception as e:
+        # Graceful degradation: fail open
+        logger.warning(f"[O11Y] Distributed trace propagation failed for task {task_id}: {e}. Falling back to unlinked root span.")
+
+# Clean up the trace context when the task finishes (success or failure)
+@task_postrun.connect
+def teardown_distributed_tracing(task_id, task, *args, **kwargs):
+    token = getattr(task.request, "otel_token", None)
+    if token:
+        otel_context.detach(token)
 
 def parse_iso_date(date_str):
     if not date_str:
@@ -253,25 +302,38 @@ def build_vector_index(job_id: str, case_id: str, parsed_data: dict):
         logger.info(f"[JOB: {job_id}] Successfully embedded and indexed {len(documents)} chunks.")
 
 
-@celery_app.task(bind=True, name="parse_ufdr_archive", max_retries=3)
-def parse_ufdr_archive(self, job_id: str, file_path: str, case_id: str):
-    logger.info(f"[JOB: {job_id}] Worker picked up task. Target file: {file_path}")
+def broadcast_update(job_id, status, phase=None, error=None):
+    """Pushes real-time updates directly to the Redis Pub/Sub for FastAPI to stream via SSE."""
+    payload = {"job_id": job_id, "status": status, "phase": phase, "error_message": error}
+    redis_publisher.publish(f"job_{job_id}", json.dumps(payload))
+
+
+@celery_app.task(bind=True, name="parse_ufdr_archive")
+def parse_ufdr_archive(self, job_id: str, object_key: str, case_id: str):
+    # Guaranteed Cross-Platform Temp Path
+    local_temp_path = os.path.join(tempfile.gettempdir(), object_key)
     
     try:
-        # PHASE 1: DECOMPRESS & PARSE
-        self.update_state(state='PARSING', meta={'progress': 'Unzipping and extracting entities...'})
-        logger.info(f"[JOB: {job_id}] Phase 1: Unzipping and extracting entities...")
+        # PHASE 0: Distributed Storage Download
+        broadcast_update(job_id, "DOWNLOADING", "Downloading from Secure Object Storage...")
+        logger.info(f"[JOB: {job_id}] Downloading {object_key} from MinIO to {local_temp_path}...")
+        s3_worker_client.download_file(settings.MINIO_BUCKET, object_key, local_temp_path)
+
+        # PHASE 1: Parsing
+        broadcast_update(job_id, "PARSING", "Unzipping and extracting entities...")
+        logger.info(f"[JOB: {job_id}] Phase 1: Parsing UFDR...")
+        
         parsed_data = {"manifest": {}, "contacts": [], "calls": [], "messages": []}
         
         with tracer.start_as_current_span("unzip_and_parse_ufdr") as span:
             span.set_attribute("job_id", job_id)
-            span.set_attribute("file_path", file_path)
+            span.set_attribute("file_path", local_temp_path)
             
-            with zipfile.ZipFile(file_path, 'r') as zf:
-                file_list = zf.namelist()
+            with zipfile.ZipFile(local_temp_path, 'r') as archive:
+                file_list = archive.namelist()
                 
                 if 'manifest.xml' in file_list:
-                    with zf.open('manifest.xml') as f:
+                    with archive.open('manifest.xml') as f:
                         device_node = ET.parse(f).getroot().find('.//Device')
                         if device_node is not None:
                             parsed_data["manifest"]["imei"] = device_node.findtext('IMEI', 'Unknown')
@@ -279,40 +341,82 @@ def parse_ufdr_archive(self, job_id: str, file_path: str, case_id: str):
                             parsed_data["manifest"]["os"] = device_node.findtext('OSVersion', 'Unknown')
                             
                 if 'contacts.json' in file_list:
-                    with zf.open('contacts.json') as f: 
+                    with archive.open('contacts.json') as f:
                         parser = ijson.items(f, 'item')
                         for contact in parser: parsed_data["contacts"].append(contact)
                         
                 if 'messages.json' in file_list:
-                    with zf.open('messages.json') as f: 
+                    with archive.open('messages.json') as f:
                         parser = ijson.items(f, 'item')
                         for message in parser: parsed_data["messages"].append(message)
                         
                 if 'calls.csv' in file_list:
-                    with zf.open('calls.csv') as f: 
+                    with archive.open('calls.csv') as f:
                         text_stream = io.TextIOWrapper(f, encoding='utf-8')
                         reader = csv.DictReader(text_stream)
                         for call in reader: parsed_data["calls"].append(call)
 
-        # PHASE 2: POSTGRESQL BULK INSERT
-        self.update_state(state='SQL_DONE', meta={'progress': 'Inserting into PostgreSQL...'})
-        logger.info(f"[JOB: {job_id}] Phase 2: Inserting into PostgreSQL...")
-        asyncio.run(bulk_insert_postgres(job_id, case_id, parsed_data))
-        
-        # PHASE 3: NEO4J GRAPH CONSTRUCTION
-        self.update_state(state='GRAPH_DONE', meta={'progress': 'Building Neo4j Graph Topology...'})
-        logger.info(f"[JOB: {job_id}] Phase 3: Building Neo4j Graph Topology...")
-        asyncio.run(build_graph_neo4j(job_id, case_id, parsed_data))
+        # Safe Async Database Execution
+        async def execute_db_inserts():
+            await db.connect()  # Safely open pool in THIS loop
+            try:
+                broadcast_update(job_id, "SQL_DONE", "Inserting into PostgreSQL...")
+                await bulk_insert_postgres(job_id, case_id, parsed_data)
+                
+                broadcast_update(job_id, "GRAPH_DONE", "Building Neo4j Topology...")
+                await build_graph_neo4j(job_id, case_id, parsed_data)
+            finally:
+                await db.disconnect()  # Safely close pool
+                
+        asyncio.run(execute_db_inserts())
 
-        # PHASE 4: QDRANT SEMANTIC CHUNKING
-        self.update_state(state='EMBEDDING', meta={'progress': 'Building Vector Index...'})
+        # PHASE 4: Qdrant
+        broadcast_update(job_id, "EMBEDDING", "Building Vector Index...")
         logger.info(f"[JOB: {job_id}] Phase 4: Building Vector Index...")
         build_vector_index(job_id, case_id, parsed_data)
 
-        logger.info(f"[JOB: {job_id}] ALL PHASES COMPLETE. Extraction successfully ingested.")
-        # Celery automatically sets the state to 'SUCCESS' when it returns
-        return {"status": "success", "job_id": job_id, "pipeline": "100% complete"}
+        # SUCCESS
+        broadcast_update(job_id, "SUCCESS", "Pipeline Complete.")
+        logger.info(f"[JOB: {job_id}] ALL PHASES COMPLETE.")
+        return {"status": "success", "job_id": job_id}
 
     except Exception as e:
-        logger.error(f"[JOB: {job_id}] Failed: {str(e)}")
-        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+        logger.error(f"[SAGA INITIATED] Pipeline failed. Error: {str(e)}")
+        broadcast_update(job_id, "FAILED", error=str(e))
+        
+        # Safe Async Saga Rollback
+        async def execute_rollback():
+            await db.connect()  # Open connection specifically for rollback
+            try:
+                async with db.pg_pool.acquire() as conn:
+                    await conn.execute("DELETE FROM messages WHERE job_id = $1", job_id)
+                    await conn.execute("DELETE FROM calls WHERE job_id = $1", job_id)
+                    await conn.execute("DELETE FROM contacts WHERE job_id = $1", job_id)
+                    await conn.execute("DELETE FROM ingested_files WHERE case_id = $1", case_id)
+                
+                async with db.neo4j_driver.session() as session:
+                    await session.run(
+                        "MATCH (c:Case {case_id: $case_id}) OPTIONAL MATCH (c)-[:OWNS]->(n) DETACH DELETE c, n", 
+                        case_id=case_id
+                    )
+                
+                # Await Qdrant delete because it uses AsyncQdrantClient
+                await db.qdrant_client.delete(
+                    collection_name="forensic_chunks",
+                    points_selector=models.Filter(
+                        must=[models.FieldCondition(key="job_id", match=models.MatchValue(value=job_id))]
+                    )
+                )
+                logger.info(f"[SAGA COMPLETE] Job {job_id} successfully rolled back.")
+            except Exception as rollback_err:
+                logger.critical(f"SAGA ROLLBACK FAILED: {str(rollback_err)}")
+            finally:
+                await db.disconnect()
+                
+        asyncio.run(execute_rollback())
+        raise e
+        
+    finally:
+        # CLEANUP
+        if os.path.exists(local_temp_path):
+            os.remove(local_temp_path)

@@ -11,13 +11,31 @@ import cohere
 from fastembed import TextEmbedding
 from qdrant_client import models
 import json
-
 from worker import celery_app, parse_ufdr_archive
 from config import settings
 from database import db
 from schemas import QueryRequest, QueryIntent, GraphNodeResult, HydratedEntity, CompiledRetrievalContext
 from telemetry import configure_telemetry
 from llm_service import CohereStrategy, CircuitBreakerLLM
+import boto3
+from sse_starlette.sse import EventSourceResponse
+import redis.asyncio as aioredis
+from fastapi import Request
+import re
+from opentelemetry.propagate import inject
+
+s3_client = boto3.client(
+    's3', 
+    endpoint_url=settings.MINIO_ENDPOINT,
+    aws_access_key_id=settings.MINIO_ACCESS_KEY,
+    aws_secret_access_key=settings.MINIO_SECRET_KEY
+)
+
+# Ensure bucket exists on startup
+try:
+    s3_client.create_bucket(Bucket=settings.MINIO_BUCKET)
+except Exception:
+    pass # Bucket already exists
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -64,19 +82,30 @@ async def extract_ufdr(case_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Invalid file type. Must be a .ufdr archive.")
 
     job_id = str(uuid.uuid4())
-    secure_file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    object_key = f"{job_id}_{file.filename}"
     hasher = hashlib.sha256()
 
     try:
-        async with aiofiles.open(secure_file_path, 'wb') as out_file:
-            while content := await file.read(1024 * 1024):  
-                await asyncio.to_thread(hasher.update, content)
-                await out_file.write(content)
+        #  ENTERPRISE UPGRADE: Offload heavy file processing & S3 network calls to a thread
+        def process_and_upload(f_obj, key):
+            # 1. Calculate Hash
+            f_obj.seek(0)
+            while chunk := f_obj.read(8192):
+                hasher.update(chunk)
+            
+            # 2. Upload to S3/MinIO
+            f_obj.seek(0)
+            s3_client.upload_fileobj(f_obj, settings.MINIO_BUCKET, key)
+
+        # Execute securely outside the main async event loop
+        await asyncio.to_thread(process_and_upload, file.file, object_key)
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload to S3: {str(e)}")
 
     file_hash = hasher.hexdigest()
 
+    #  POSTGRES DUPLICATE CHECK
     async with db.pg_pool.acquire() as conn:
         existing_record = await conn.fetchval(
             "SELECT id FROM ingested_files WHERE case_id = $1 AND file_hash = $2",
@@ -84,7 +113,8 @@ async def extract_ufdr(case_id: str, file: UploadFile = File(...)):
         )
         
         if existing_record:
-            os.remove(secure_file_path) 
+            # Cleanup the orphaned S3 object if it's a duplicate
+            await asyncio.to_thread(s3_client.delete_object, Bucket=settings.MINIO_BUCKET, Key=object_key)
             return JSONResponse(
                 status_code=409, 
                 content={
@@ -98,7 +128,15 @@ async def extract_ufdr(case_id: str, file: UploadFile = File(...)):
             case_id, file_hash, file.filename
         )
 
-    task = parse_ufdr_archive.apply_async(args=[job_id, secure_file_path, case_id], task_id=job_id)
+    #  DISPATCH TO CELERY: Inject W3C Trace Context
+    celery_headers = {}
+    inject(celery_headers) 
+    
+    task = parse_ufdr_archive.apply_async(
+        args=[job_id, object_key, case_id], 
+        task_id=job_id,
+        headers=celery_headers 
+    )
     
     return JSONResponse(
         status_code=202,
@@ -109,15 +147,25 @@ async def extract_ufdr(case_id: str, file: UploadFile = File(...)):
     )
 
 
-@app.get("/api/v1/jobs/{job_id}/status", tags=["Ingestion"])
-async def get_job_status(job_id: str):
-    """Fetch the real-time status of the Celery worker."""
-    task = celery_app.AsyncResult(job_id)
-    return JSONResponse(status_code=200, content={
-        "job_id": job_id,
-        "status": task.state,
-        "error_message": str(task.info) if task.state == 'FAILURE' else None
-    })
+@app.get("/api/v1/jobs/{job_id}/stream", tags=["Ingestion"])
+async def stream_job_status(job_id: str, request: Request):
+    """Server-Sent Events (SSE) endpoint for real-time Celery status."""
+    async def event_generator():
+        redis_client = aioredis.from_url(settings.REDIS_URL)
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(f"job_{job_id}")
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message:
+                    yield {"data": message["data"].decode("utf-8")}
+        finally:
+            await pubsub.unsubscribe()
+            await redis_client.aclose()
+            
+    return EventSourceResponse(event_generator())
 
 
 class HybridRetrievalService:
@@ -128,136 +176,178 @@ class HybridRetrievalService:
 
     async def classify_intent(self, query: str) -> QueryIntent:
         prompt = f"""Analyze this forensic query: '{query}'
-        Output a JSON object with these boolean flags:
-        - requires_graph: True ONLY if asking for frequency, relationships, or counts of calls/messages.
-        - requires_sql_identity: True if asking about contact names, aliases, anomalies, or who a number is saved as.
-        - requires_semantic: True if asking for conversational context, tone, or specific topics.
-        - extracted_identifiers: Any explicit phone numbers or names mentioned.
+        You are an AI query planner. Output a JSON object with these fields:
+        - requires_graph: (boolean) True if asking for frequency, relationships, counts, or timelines of calls/messages.
+        - requires_sql_identity: (boolean) True if asking about contact names, aliases, or anomalies.
+        - requires_semantic: (boolean) True if asking for conversational context, tone, or specific topics.
+        - extracted_identifiers: (list of strings) Any explicit phone numbers or names mentioned.
+        - optimized_search_queries: (list of strings) If requires_semantic is True, generate 1-3 highly specific, keyword-dense search phrases to run against the Vector Database. Exclude conversational words. (e.g. for "Are they talking about hiding money?", output ["hiding money", "offshore accounts", "wire transfer"]).
         Respond ONLY with valid JSON."""
         
         try:
             response = await self.cohere.chat(message=prompt, model="command-r-08-2024")
             raw_json = response.text.replace('```json', '').replace('```', '').strip()
-            return QueryIntent(**json.loads(raw_json))
-        except Exception:
-            return QueryIntent(requires_graph=True, requires_sql_identity=True, requires_semantic=True)
+            data = json.loads(raw_json)
+            
+            # Dynamically attach the optimized queries to the intent object
+            intent = QueryIntent(**data)
+            intent.optimized_search_queries = data.get("optimized_search_queries", [])
+            return intent
+        except Exception as e:
+            print(f"Agentic Planner Failed: {e}")
+            intent = QueryIntent(requires_graph=True, requires_sql_identity=True, requires_semantic=True)
+            intent.optimized_search_queries = [query]
+            return intent
 
-    async def fetch_identity_anomalies(self, case_id: str) -> list[dict]:
-        """Phase 2A: Relational SQL Macro for Identity Resolution"""
+    async def fetch_dynamic_identities(self, case_id: str, identifiers: list[str]) -> list[dict]:
+        """Phase 2A: Dynamic SQL Retrieval. Searches for specific entities or falls back to anomalies."""
         async with self.db.pg_pool.acquire() as conn:
-            query = """
-                SELECT phone, array_agg(DISTINCT display_name) as known_aliases
-                FROM (
-                    SELECT unnest(phone_numbers) as phone, display_name
-                    FROM contacts
-                    WHERE case_id = $1 AND display_name IS NOT NULL
-                ) subquery
-                GROUP BY phone
-                HAVING count(DISTINCT display_name) > 1;
-            """
-            rows = await conn.fetch(query, case_id)
-            return [{"phone": row["phone"], "known_aliases": row["known_aliases"]} for row in rows]
+            if not identifiers:
+                # Fallback: Macro-level identity anomalies
+                query = """
+                    SELECT phone, array_agg(DISTINCT display_name) as known_aliases
+                    FROM (SELECT unnest(phone_numbers) as phone, display_name FROM contacts WHERE case_id = $1) sub
+                    GROUP BY phone HAVING count(DISTINCT display_name) > 1;
+                """
+                rows = await conn.fetch(query, case_id)
+                return [{"phone": row["phone"], "known_aliases": row["known_aliases"]} for row in rows]
 
-    async def fetch_graph_topology(self, case_id: str) -> list[GraphNodeResult]:
-        """Phase 2B: Calculate actual relationship math in Neo4j bounded by Case RBAC."""
+            # Dynamic Target Search
+            results = []
+            for ident in identifiers:
+                query = """
+                    SELECT unnest(phone_numbers) as phone, array_agg(DISTINCT display_name) as known_aliases
+                    FROM contacts
+                    WHERE case_id = $1 AND (display_name ILIKE $2 OR $3 = ANY(phone_numbers))
+                    GROUP BY phone
+                """
+                rows = await conn.fetch(query, case_id, f"%{ident}%", ident)
+                for r in rows:
+                    results.append({"phone": r["phone"], "known_aliases": r["known_aliases"]})
+            return results
+
+    async def fetch_dynamic_topology(self, case_id: str, target_phones: list[str]) -> list[GraphNodeResult]:
+        """Phase 2B: Temporal Cypher Retrieval."""
         results = []
-        cypher = """
-        MATCH (c:Case {case_id: $case_id})-[:OWNS]->(sender:PhoneNumber)-[:MADE_CALL|SENT_MESSAGE]->(event)-[:RECEIVED_BY]->(receiver:PhoneNumber)<-[:OWNS]-(c)
-        RETURN sender.e164 AS source, receiver.e164 AS target, labels(event)[0] AS rel_type, count(event) AS frequency
-        ORDER BY frequency DESC LIMIT 10
-        """
+        if not target_phones:
+            cypher = """
+            MATCH (c:Case {case_id: $case_id})-[:OWNS]->(sender:PhoneNumber)-[:MADE_CALL|SENT_MESSAGE]->(event)-[:RECEIVED_BY]->(receiver:PhoneNumber)<-[:OWNS]-(c)
+            RETURN sender.e164 AS source, receiver.e164 AS target, labels(event)[0] AS rel_type, 
+                   count(event) AS frequency, 
+                   collect(toString(coalesce(event.started_at, event.sent_at)))[0..15] AS interaction_times
+            ORDER BY frequency DESC LIMIT 10
+            """
+            params = {"case_id": case_id}
+        else:
+            cypher = """
+            MATCH (c:Case {case_id: $case_id})-[:OWNS]->(sender:PhoneNumber)-[:MADE_CALL|SENT_MESSAGE]->(event)-[:RECEIVED_BY]->(receiver:PhoneNumber)<-[:OWNS]-(c)
+            WHERE sender.e164 IN $targets OR receiver.e164 IN $targets
+            RETURN sender.e164 AS source, receiver.e164 AS target, labels(event)[0] AS rel_type, 
+                   count(event) AS frequency, 
+                   collect(toString(coalesce(event.started_at, event.sent_at)))[0..15] AS interaction_times
+            ORDER BY frequency DESC LIMIT 25
+            """
+            params = {"case_id": case_id, "targets": target_phones}
+
         try:
             async with self.db.neo4j_driver.session() as session:
-                records = await session.run(cypher, case_id=case_id)
+                records = await session.run(cypher, **params)
                 for record in await records.data():
                     results.append(GraphNodeResult(
                         source_number=record["source"],
                         target_number=record["target"],
                         interaction_type=record["rel_type"],
-                        frequency=record["frequency"] or 1
+                        frequency=record["frequency"] or 1,
+                        interaction_times=record.get("interaction_times", []) # 🚀 Now passing times!
                     ))
         except Exception as e:
             print(f"Graph retrieval failed: {e}")
         return results
 
     async def hydrate_identities(self, graph_results: list[GraphNodeResult]) -> list[HydratedEntity]:
-        """Phase 3: Batch Hydration (O(1) Network Calls)"""
         unique_numbers = set()
         for res in graph_results:
             unique_numbers.add(res.source_number)
             unique_numbers.add(res.target_number)
 
-        if not unique_numbers:
-            return []
+        if not unique_numbers: return []
 
         hydrated = []
         async with self.db.pg_pool.acquire() as conn:
-            query = """
-                SELECT display_name, organization, phone_numbers 
-                FROM contacts 
-                WHERE phone_numbers && $1::text[]
-            """
+            query = "SELECT display_name, organization, phone_numbers FROM contacts WHERE phone_numbers && $1::text[]"
             rows = await conn.fetch(query, list(unique_numbers))
-
             for row in rows:
-                db_phones = set(row["phone_numbers"])
-                matched_numbers = unique_numbers.intersection(db_phones)
-                
+                matched_numbers = unique_numbers.intersection(set(row["phone_numbers"]))
                 for number in matched_numbers:
                     hydrated.append(HydratedEntity(
-                        phone_number=number,
-                        display_name=row["display_name"],
-                        organization=row["organization"]
+                        phone_number=number, display_name=row["display_name"], organization=row["organization"]
                     ))
         return hydrated
 
-    async def fetch_semantic_chunks(self, query: str, case_id: str) -> list[dict]:
-        """Phase 4: Fetch context from Qdrant using case_id."""
-        query_vector = list(self.embedder.embed([query]))[0].tolist()
-        
-        search_filter = None
-        if case_id:
-            search_filter = models.Filter(
-                must=[models.FieldCondition(key="case_id", match=models.MatchValue(value=case_id))]
+    async def fetch_semantic_chunks(self, optimized_queries: list[str], case_id: str) -> list[dict]:
+        if not optimized_queries:
+            return []
+            
+        # Embed all optimized queries generated by the AI planner
+        query_vectors = await asyncio.to_thread(lambda: list(self.embedder.embed(optimized_queries)))
+        search_filter = models.Filter(must=[models.FieldCondition(key="case_id", match=models.MatchValue(value=case_id))]) if case_id else None
+
+        all_points = []
+        # Search Qdrant for each optimized query
+        for vector in query_vectors:
+            search_response = await self.db.qdrant_client.query_points(
+                collection_name="forensic_chunks", query=vector.tolist(), using="fast-bge-small-en-v1.5", query_filter=search_filter, limit=4 
             )
+            all_points.extend(search_response.points)
 
-        search_response = await self.db.qdrant_client.query_points(
-            collection_name="forensic_chunks",
-            query=query_vector,
-            using="fast-bge-small-en-v1.5",
-            query_filter=search_filter,
-            limit=5 
-        )
+        # Deduplicate results based on chunk ID
+        unique_chunks = {str(hit.id): hit for hit in all_points}
 
-        documents = []
-        for hit in search_response.points:
-            payload = hit.payload
-            documents.append({
-                "id": str(hit.id),
-                "text": payload.get("document", ""),
-                "thread": payload.get("thread_id", "Unknown"),
-                "timeframe": f"{payload.get('start_time')} to {payload.get('end_time')}"
-            })
-        return documents
+        return [{
+            "id": chunk_id, "text": hit.payload.get("document", ""),
+            "thread": hit.payload.get("thread_id", "Unknown"),
+            "timeframe": f"{hit.payload.get('start_time')} to {hit.payload.get('end_time')}"
+        } for chunk_id, hit in unique_chunks.items()]
 
     async def execute(self, request: QueryRequest) -> CompiledRetrievalContext:
-        """Orchestrates the Intent-Based Data Flow."""
+        """The Orchestrator - Upgraded for Semantic-to-Graph Cross-Pollination"""
+        import re # Required for cross-pollination regex
+        
         intent = await self.classify_intent(request.query)
         context = CompiledRetrievalContext(query_intent=intent)
+        resolved_phones = []
 
-        # 1. Fetch Identities (if needed)
-        if intent.requires_sql_identity:
-            context.sql_facts = await self.fetch_identity_anomalies(request.case_id)
+        # 1. SQL Resolution: Turn Names into Phone Numbers
+        if intent.requires_sql_identity or intent.extracted_identifiers:
+            context.sql_facts = await self.fetch_dynamic_identities(request.case_id, intent.extracted_identifiers)
+            resolved_phones.extend([fact["phone"] for fact in context.sql_facts])
+            
+            # Normalize explicit phone numbers (strip dashes/spaces so +1-555 becomes +1555)
+            for ident in intent.extracted_identifiers:
+                clean_phone = ''.join(c for c in ident if c.isdigit() or c == '+')
+                if len(clean_phone) >= 7:
+                    resolved_phones.append(clean_phone)
 
-        # 2. Fetch Graph Topology (if needed)
-        if intent.requires_graph:
-            context.graph_facts = await self.fetch_graph_topology(request.case_id)
+        # 2. Semantic Retrieval 
+        if intent.requires_semantic:
+            search_queries = intent.optimized_search_queries if intent.optimized_search_queries else [request.query]
+            
+            context.semantic_chunks = await self.fetch_semantic_chunks(search_queries, request.case_id)
+            
+            # CROSS-POLLINATION: Extract phone numbers from the semantic text
+            if context.semantic_chunks:
+                for chunk in context.semantic_chunks:
+                    phones = re.findall(r'\+?\d{7,15}', chunk["text"])
+                    resolved_phones.extend(phones)
+
+        # Deduplicate the phone numbers
+        resolved_phones = list(set(resolved_phones))
+
+        # 3. Graph Retrieval 
+        if intent.requires_graph or resolved_phones:
+            context.graph_facts = await self.fetch_dynamic_topology(request.case_id, resolved_phones)
             if context.graph_facts:
                 context.hydrated_entities = await self.hydrate_identities(context.graph_facts)
-                
-        # 3. Fetch Semantic Texts (if needed)
-        if intent.requires_semantic:
-            context.semantic_chunks = await self.fetch_semantic_chunks(request.query, request.case_id)
 
         return context
 
@@ -269,12 +359,17 @@ async def query_forensic_data(request: QueryRequest):
     """
     retriever = HybridRetrievalService(db, cohere_client, embedding_model)
     context_data = await retriever.execute(request)
-    
+
     if not context_data.graph_facts and not context_data.semantic_chunks and not context_data.sql_facts:
-        return JSONResponse(
-            status_code=404, 
-            content={"message": "No relevant forensic data found in indices."}
-        )
+        return {
+            "query": request.query,
+            "intent_detected": context_data.query_intent.dict(),
+            "answer": "No relevant forensic data was found in the database to answer this query. The specific identifiers or topics mentioned do not exist in this extraction.",
+            "citations": [],
+            "hydrated_identities": [],
+            "graph_facts": [],
+            "sql_facts": []
+        }
 
     system_prompt = f"""## ROLE
         You are an expert Digital Forensics and E-Discovery AI Analyst. Your mandate is to assist human investigators by analyzing extracted mobile device data (chat threads, call records, and forensic metadata).
@@ -375,6 +470,68 @@ async def get_full_graph(case_id: str):
             
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"Graph retrieval failed: {str(e)}"})
+    
+@app.delete("/api/v1/cases/{case_id}", tags=["Case Management"])
+async def delete_case(case_id: str):
+    """Surgically deletes a case and all its data across all 3 databases AND Cloud Storage."""
+    try:
+        async with db.pg_pool.acquire() as conn:
+            # 1. Fetch all associated Job IDs for this case to locate the raw files in MinIO
+            jobs = await conn.fetch("""
+                SELECT DISTINCT job_id FROM contacts WHERE case_id = $1 
+                UNION 
+                SELECT DISTINCT job_id FROM messages WHERE case_id = $1 
+                UNION 
+                SELECT DISTINCT job_id FROM calls WHERE case_id = $1
+            """, case_id)
+            
+            job_ids = [job['job_id'] for job in jobs]
+
+            # 2. Delete raw .ufdr files from MinIO (Cloud Storage)
+            for j_id in job_ids:
+                # List objects matching the job_id prefix
+                response = await asyncio.to_thread(
+                    s3_client.list_objects_v2, 
+                    Bucket=settings.MINIO_BUCKET, 
+                    Prefix=j_id
+                )
+                
+                if 'Contents' in response:
+                    for obj in response['Contents']:
+                        await asyncio.to_thread(
+                            s3_client.delete_object, 
+                            Bucket=settings.MINIO_BUCKET, 
+                            Key=obj['Key']
+                        )
+
+            # 3. Delete structured data from PostgreSQL
+            await conn.execute("DELETE FROM messages WHERE case_id = $1", case_id)
+            await conn.execute("DELETE FROM calls WHERE case_id = $1", case_id)
+            await conn.execute("DELETE FROM contacts WHERE case_id = $1", case_id)
+            await conn.execute("DELETE FROM ingested_files WHERE case_id = $1", case_id)
+
+        # 4. Delete topological data from Neo4j
+        async with db.neo4j_driver.session() as session:
+            await session.run(
+                "MATCH (c:Case {case_id: $case_id}) OPTIONAL MATCH (c)-[:OWNS]->(n) DETACH DELETE c, n", 
+                case_id=case_id
+            )
+
+        # 5. Delete semantic vectors from Qdrant
+        await db.qdrant_client.delete(
+            collection_name="forensic_chunks",
+            points_selector=models.Filter(
+                must=[models.FieldCondition(key="case_id", match=models.MatchValue(value=case_id))]
+            )
+        )
+
+        return JSONResponse(
+            status_code=200, 
+            content={"message": f"Case {case_id} and all associated raw cloud files successfully purged."}
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete case: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
