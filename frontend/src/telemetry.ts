@@ -1,5 +1,4 @@
 import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
-import { ConsoleSpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { DocumentLoadInstrumentation } from '@opentelemetry/instrumentation-document-load';
 import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
 import { XMLHttpRequestInstrumentation } from '@opentelemetry/instrumentation-xml-http-request';
@@ -25,20 +24,18 @@ export const initializeTelemetry = () => {
       new DocumentLoadInstrumentation(),
       new XMLHttpRequestInstrumentation({
         propagateTraceHeaderCorsUrls: [
-          /http:\/\/127\.0\.0\.1:8000\.*/,
-          /http:\/\/localhost:8000\.*/,
+          /http:\/\/.+:8000.*/, // 🚀 FIX: Allow trace headers to be sent to any host IP
           /^\/api\/.*/ 
         ],
       }),
       new FetchInstrumentation({
         propagateTraceHeaderCorsUrls: [
-          /http:\/\/127\.0\.0\.1:8000\.*/,
-          /http:\/\/localhost:8000\.*/,
+          /http:\/\/.+:8000.*/, // 🚀 FIX: Allow trace headers to be sent to any host IP
           /^\/api\/.*/ 
         ],
       }),
     ],
   });
-
+  
   console.log(" OpenTelemetry Web Instrumentation Initialized");
 };

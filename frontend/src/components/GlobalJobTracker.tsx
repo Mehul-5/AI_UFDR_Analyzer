@@ -7,7 +7,7 @@ const JobToast: React.FC<{ jobId: string }> = ({ jobId }) => {
 
   useEffect(() => {
     // Open a persistent Server-Sent Events connection
-    const sse = new EventSource(`http://localhost:8000/api/v1/jobs/${jobId}/stream`);
+    const sse = new EventSource(`http://${window.location.hostname}:8000/api/v1/jobs/${jobId}/stream`);
     
     sse.onmessage = (event) => {
       const data = JSON.parse(event.data);

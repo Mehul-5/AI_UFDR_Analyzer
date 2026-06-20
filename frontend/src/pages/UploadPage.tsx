@@ -60,6 +60,20 @@ export default function UploadPage() {
     }
   };
 
+  const handleDeleteCase = async (caseIdToDelete: string, e: React.MouseEvent) => {
+    e.stopPropagation(); 
+    const isConfirmed = window.confirm(`⚠️ WARNING: Are you sure you want to permanently delete Case "${caseIdToDelete}"?\n\nThis will purge all data from PostgreSQL, Neo4j, Qdrant, and MinIO. This action cannot be undone.`);
+    if (!isConfirmed) return;
+
+    try {
+      await api.delete(`/api/v1/cases/${encodeURIComponent(caseIdToDelete)}`);
+      setCases((prev) => prev.filter(c => c !== caseIdToDelete));
+    } catch (error: any) {
+      console.error("Failed to delete case", error);
+      alert(`Failed to delete case: ${error.response?.data?.detail || error.message}`);
+    }
+  };
+
   const handleLogout = () => {
     localStorage.removeItem('auth_token');
     navigate('/login');
@@ -102,9 +116,22 @@ export default function UploadPage() {
                   {cases.map((id) => (
                     <li key={id} className="bg-white border border-slate-200 rounded-lg shadow-sm hover:shadow-md hover:border-amber-400 transition-all group">
                       <div className="p-4 flex flex-col">
-                        <span className="font-mono text-sm font-bold text-slate-800 truncate mb-3" title={id}>
-                          {id}
-                        </span>
+                        
+                        <div className="flex justify-between items-center mb-3">
+                          <span className="font-mono text-sm font-bold text-slate-800 truncate" title={id}>
+                            {id}
+                          </span>
+                          <button 
+                            onClick={(e) => handleDeleteCase(id, e)} 
+                            className="flex items-center gap-1 text-slate-400 hover:text-red-600 hover:bg-red-50 transition-all p-1.5 rounded-md" 
+                            title="Purge Case"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                          </button>
+                        </div>
+
                         <button 
                           onClick={() => navigate(`/dashboard/${id}`)}
                           className="w-full bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs py-2.5 rounded transition-colors uppercase tracking-wide"

@@ -4,6 +4,7 @@ from qdrant_client import AsyncQdrantClient
 import logging
 import asyncio
 from config import settings
+from auth import get_password_hash
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -32,8 +33,6 @@ class DatabaseManager:
                 );
             """)
 
-            # 2. Inject Default Admin User (Password: admin123)
-            from auth import get_password_hash
             default_hash = get_password_hash("admin123")
             await conn.execute("""
                 INSERT INTO users (username, hashed_password)

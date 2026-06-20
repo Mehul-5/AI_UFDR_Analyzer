@@ -76,18 +76,62 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
-    # Cap Redis memory and force it to evict old keys if full
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-    volumes:
-      - redis_data:/data
+
+  backend:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: ufdr-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_SERVER=postgres
+      - NEO4J_URI=bolt://neo4j:7687
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+    depends_on:
+      - postgres
+      - neo4j
+      - qdrant
+      - minio
+      - redis
+
+  worker:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: ufdr-celery-worker
+    restart: unless-stopped
+    command: celery -A worker.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_SERVER=postgres
+      - NEO4J_URI=bolt://neo4j:7687
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+    depends_on:
+      - backend
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ufdr-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
 
 volumes:
+  minio_data:
   postgres_data:
   neo4j_data:
   qdrant_data:
-  redis_data:
-  minio_data:
