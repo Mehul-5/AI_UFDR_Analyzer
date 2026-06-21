@@ -1,0 +1,32 @@
+name: Production Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main 
+
+jobs:
+  deploy:
+    name: Deploy to DigitalOcean
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Execute Remote Deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # 1. Navigate to the project folder on the server
+            cd /opt/AI_UFDR_Analyzer
+            
+            # 2. Pull the latest code from GitHub
+            git fetch --all
+            git reset --hard origin/main
+            
+            # 3. Rebuild and restart the containers silently
+            docker-compose up --build -d
+            
+            # 4. Clean up old/dangling Docker images to save disk space
+            docker image prune -f
