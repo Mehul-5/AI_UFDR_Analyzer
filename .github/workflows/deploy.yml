@@ -17,4 +17,4 @@ jobs:
       - name:  Test Docker Compose Build
         run: |
           echo "Building enterprise Docker architecture..."
-          docker-compose build
+          docker compose build
