@@ -18,3 +18,5 @@ postgres_data/
 neo4j_data/
 qdrant_data/
 redis_data/
+Caddyfile.local
+docker-compose.local.yml

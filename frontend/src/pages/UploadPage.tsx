@@ -65,8 +65,14 @@ export default function UploadPage() {
     const isConfirmed = window.confirm(`⚠️ WARNING: Are you sure you want to permanently delete Case "${caseIdToDelete}"?\n\nThis will purge all data from PostgreSQL, Neo4j, Qdrant, and MinIO. This action cannot be undone.`);
     if (!isConfirmed) return;
 
+    // Deleting is protected by a password that only the deployment owner knows.
+    const deletePassword = window.prompt('Enter the delete password to continue:');
+    if (!deletePassword) return; // cancelled or left empty
+
     try {
-      await api.delete(`/api/v1/cases/${encodeURIComponent(caseIdToDelete)}`);
+      await api.delete(`/api/v1/cases/${encodeURIComponent(caseIdToDelete)}`, {
+        headers: { 'X-Delete-Password': deletePassword },
+      });
       setCases((prev) => prev.filter(c => c !== caseIdToDelete));
     } catch (error: any) {
       console.error("Failed to delete case", error);

@@ -69,9 +69,9 @@ services:
     restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/password
-      NEO4J_server_memory_heap_initial__size: 384m
-      NEO4J_server_memory_heap_max__size: 384m
-      NEO4J_server_memory_pagecache_size: 96m
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 256m
+      NEO4J_server_memory_pagecache_size: 64m
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -81,7 +81,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 60s
-    mem_limit: 800m
+    mem_limit: 768m
     logging: *logging
 
   qdrant:

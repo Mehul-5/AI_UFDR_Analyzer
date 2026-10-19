@@ -4,7 +4,7 @@ import os
 import uuid
 import aiofiles
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import cohere
@@ -22,6 +22,7 @@ from sse_starlette.sse import EventSourceResponse
 import redis.asyncio as aioredis
 from fastapi import Request
 import re
+import secrets
 from opentelemetry.propagate import inject
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import Depends
@@ -71,9 +72,32 @@ UPLOAD_DIR = "secure_store"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- Abuse protection for a public demo ---------------------------------
-# Only this username may delete cases. Register it once, then set ADMIN_USERNAME in .env.
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+# Deleting a case requires this password (sent in the X-Delete-Password header).
+# If DELETE_PASSWORD is empty, deletion is disabled entirely.
+DELETE_PASSWORD = os.getenv("DELETE_PASSWORD", "")
+DELETE_MAX_FAILED_ATTEMPTS = 5      # wrong guesses allowed per user...
+DELETE_LOCKOUT_SECONDS = 900        # ...per 15 minutes
 QUERY_LIMIT_PER_HOUR = int(os.getenv("QUERY_LIMIT_PER_HOUR", "30"))
+
+
+async def verify_delete_password(username: str, supplied: str) -> None:
+    """Checks the delete password in constant time and locks out repeated wrong guesses."""
+    if not DELETE_PASSWORD:
+        raise HTTPException(status_code=403, detail="Deletion is disabled on this deployment.")
+    redis_client = aioredis.from_url(settings.REDIS_URL)
+    try:
+        key = f"deletefail:{username}"
+        fails = await redis_client.get(key)
+        if fails and int(fails) >= DELETE_MAX_FAILED_ATTEMPTS:
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Try again in 15 minutes.")
+        if not secrets.compare_digest(supplied.encode(), DELETE_PASSWORD.encode()):
+            count = await redis_client.incr(key)
+            if count == 1:
+                await redis_client.expire(key, DELETE_LOCKOUT_SECONDS)
+            raise HTTPException(status_code=403, detail="Incorrect delete password.")
+        await redis_client.delete(key)
+    finally:
+        await redis_client.aclose()
 
 
 async def enforce_query_rate_limit(username: str) -> None:
@@ -531,10 +555,13 @@ async def get_full_graph(case_id: str, current_user: str = Depends(get_current_u
         return JSONResponse(status_code=500, content={"detail": f"Graph retrieval failed: {str(e)}"})
     
 @app.delete("/api/v1/cases/{case_id}", tags=["Case Management"])
-async def delete_case(case_id: str, current_user: str = Depends(get_current_user)):
+async def delete_case(
+    case_id: str,
+    current_user: str = Depends(get_current_user),
+    x_delete_password: str = Header(default=""),
+):
     """Surgically deletes a case and all its data across all 3 databases AND Cloud Storage."""
-    if not ADMIN_USERNAME or current_user != ADMIN_USERNAME:
-        raise HTTPException(status_code=403, detail="Only the administrator can delete cases.")
+    await verify_delete_password(current_user, x_delete_password)
     try:
         async with db.pg_pool.acquire() as conn:
             # 1. Fetch all associated Job IDs for this case to locate the raw files in MinIO
