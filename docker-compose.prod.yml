@@ -1,0 +1,176 @@
+# docker-compose.prod.yml
+# Single-host demo deployment (AWS EC2). Only Caddy is reachable from the internet.
+# The React frontend is hosted on Vercel, so there is no frontend container here.
+# Run with:  docker compose -f docker-compose.prod.yml up -d --build
+#
+# Credentials below are kept identical to your dev docker-compose.yml so your
+# existing .env keeps working. Nothing but Caddy publishes a port, so the databases
+# and MinIO are reachable only on the internal Docker network.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  caddy:
+    image: caddy:2
+    container_name: ufdr-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    mem_limit: 64m
+    logging: *logging
+
+  minio:
+    image: minio/minio
+    container_name: ufdr-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    mem_limit: 256m
+    logging: *logging
+
+  postgres:
+    image: postgres:16
+    container_name: ufdr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ufdr_user
+      POSTGRES_PASSWORD: ufdr_password
+      POSTGRES_DB: ufdr_db
+    command: postgres -c shared_buffers=64MB -c max_connections=30
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ufdr_user -d ufdr_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+    logging: *logging
+
+  neo4j:
+    image: neo4j:5
+    container_name: ufdr-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_server_memory_heap_initial__size: 384m
+      NEO4J_server_memory_heap_max__size: 384m
+      NEO4J_server_memory_pagecache_size: 96m
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      # Light TCP check on the Bolt port (avoids spawning a JVM like cypher-shell would)
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/7687"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    mem_limit: 800m
+    logging: *logging
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.0
+    container_name: ufdr-qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: 2
+    volumes:
+      - qdrant_data:/qdrant/storage
+    mem_limit: 384m
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: ufdr-redis
+    restart: unless-stopped
+    # noeviction: Redis is the Celery broker; LRU eviction could silently drop queued tasks.
+    command: redis-server --maxmemory 100mb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 128m
+    logging: *logging
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ufdr-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_SERVER=postgres
+      - NEO4J_URI=bolt://neo4j:7687
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_started
+    mem_limit: 640m
+    logging: *logging
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ufdr-celery-worker
+    restart: unless-stopped
+    # --pool=solo: one task at a time in the main process, flat memory (matches your design doc)
+    command: celery -A worker.celery_app worker --loglevel=info --pool=solo
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_SERVER=postgres
+      - NEO4J_URI=bolt://neo4j:7687
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_started
+    mem_limit: 640m
+    logging: *logging
+
+volumes:
+  minio_data:
+  postgres_data:
+  neo4j_data:
+  qdrant_data:
+  caddy_data:
+  caddy_config:

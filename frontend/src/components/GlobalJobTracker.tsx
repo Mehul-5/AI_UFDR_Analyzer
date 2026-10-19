@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useJobs } from '../context/JobContext';
+import { API_URL } from '../services/api';
 
 const JobToast: React.FC<{ jobId: string }> = ({ jobId }) => {
   const { removeJob } = useJobs();
@@ -7,7 +8,7 @@ const JobToast: React.FC<{ jobId: string }> = ({ jobId }) => {
 
   useEffect(() => {
     // Open a persistent Server-Sent Events connection
-    const sse = new EventSource(`http://${window.location.hostname}:8000/api/v1/jobs/${jobId}/stream`);
+    const sse = new EventSource(`${API_URL}/api/v1/jobs/${jobId}/stream`);
     
     sse.onmessage = (event) => {
       const data = JSON.parse(event.data);

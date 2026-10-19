@@ -1,8 +1,8 @@
 import { useParams, useNavigate } from 'react-router-dom';
-import axios from 'axios';
 import TopologyGraph from '../components/graph/TopologyGraph';
 import InvestigatorChat from '../components/chat/InvestigatorChat';
 import { useState, useEffect } from 'react';
+import api from '../services/api';
 
 export default function DashboardPage() {
   const { caseId } = useParams();
@@ -35,7 +35,7 @@ export default function DashboardPage() {
   const loadMacroGraph = async () => {
     setIsLoadingGraph(true);
     try {
-      const res = await axios.get(`/api/v1/cases/${caseId}/graph`);
+      const res = await api.get(`/api/v1/cases/${caseId}/graph`);
       setGraphData(res.data);
       setSelectedNode(null);
     } catch (error) {

@@ -1,0 +1,9 @@
+3-108-187-29.sslip.io {
+	# API only: the React frontend lives on Vercel and calls this host directly.
+	# Routes are /api/v1/*, /health, /docs, /openapi.json, so everything goes to FastAPI.
+	# No gzip here on purpose: keeps the SSE job-status stream unbuffered.
+	request_body {
+		max_size 15MB
+	}
+	reverse_proxy backend:8000
+}

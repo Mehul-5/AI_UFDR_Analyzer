@@ -70,6 +70,28 @@ llm_gateway = CircuitBreakerLLM(strategy=CohereStrategy())
 UPLOAD_DIR = "secure_store"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# --- Abuse protection for a public demo ---------------------------------
+# Only this username may delete cases. Register it once, then set ADMIN_USERNAME in .env.
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+QUERY_LIMIT_PER_HOUR = int(os.getenv("QUERY_LIMIT_PER_HOUR", "30"))
+
+
+async def enforce_query_rate_limit(username: str) -> None:
+    """Per-user hourly cap on LLM queries (protects Cohere credits, even from self-registered accounts)."""
+    redis_client = aioredis.from_url(settings.REDIS_URL)
+    try:
+        key = f"ratelimit:query:{username}"
+        count = await redis_client.incr(key)
+        if count == 1:
+            await redis_client.expire(key, 3600)
+        if count > QUERY_LIMIT_PER_HOUR:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Query limit reached ({QUERY_LIMIT_PER_HOUR}/hour). Please try again later.",
+            )
+    finally:
+        await redis_client.aclose()
+
 
 @app.get("/health", tags=["System"])
 async def health_check():
@@ -389,10 +411,11 @@ class HybridRetrievalService:
 
 
 @app.post("/api/v1/query", tags=["AI Analysis"])
-async def query_forensic_data(request: QueryRequest):
+async def query_forensic_data(request: QueryRequest, current_user: str = Depends(get_current_user)):
     """
     Executes a Hybrid Retrieval-Augmented Generation (RAG) query.
     """
+    await enforce_query_rate_limit(current_user)
     retriever = HybridRetrievalService(db, cohere_client, embedding_model)
     context_data = await retriever.execute(request)
 
@@ -448,7 +471,7 @@ async def query_forensic_data(request: QueryRequest):
     
 
 @app.get("/api/v1/cases", tags=["Case Management"])
-async def list_cases():
+async def list_cases(current_user: str = Depends(get_current_user)):
     """Fetches all unique cases that have been ingested into Neo4j."""
     try:
         async with db.neo4j_driver.session() as session:
@@ -460,7 +483,7 @@ async def list_cases():
 
 
 @app.get("/api/v1/cases/{case_id}/graph", tags=["Case Management"])
-async def get_full_graph(case_id: str):
+async def get_full_graph(case_id: str, current_user: str = Depends(get_current_user)):
     """Fetches the macro topology with full properties for the inspector panel."""
     cypher = """
     MATCH (c:Case {case_id: $case_id})-[:OWNS]->(n)
@@ -508,8 +531,10 @@ async def get_full_graph(case_id: str):
         return JSONResponse(status_code=500, content={"detail": f"Graph retrieval failed: {str(e)}"})
     
 @app.delete("/api/v1/cases/{case_id}", tags=["Case Management"])
-async def delete_case(case_id: str):
+async def delete_case(case_id: str, current_user: str = Depends(get_current_user)):
     """Surgically deletes a case and all its data across all 3 databases AND Cloud Storage."""
+    if not ADMIN_USERNAME or current_user != ADMIN_USERNAME:
+        raise HTTPException(status_code=403, detail="Only the administrator can delete cases.")
     try:
         async with db.pg_pool.acquire() as conn:
             # 1. Fetch all associated Job IDs for this case to locate the raw files in MinIO

@@ -1,9 +1,14 @@
 import axios from 'axios';
 
-const API_URL = `http://${window.location.hostname}:8000`;
+// Single source of truth for the backend address.
+// - On Vercel: set VITE_API_URL to https://3-108-187-29.sslip.io (no trailing slash).
+// - Local dev: falls back to port 8000 on the same host, as before.
+export const API_URL: string = (
+  import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000`
+).replace(/\/$/, '');
 
 const api = axios.create({
-  baseURL: API_URL, 
+  baseURL: API_URL,
 });
 
 // Automatically inject JWT token into every request
